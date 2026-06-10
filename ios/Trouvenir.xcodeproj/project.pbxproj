@@ -12,9 +12,9 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		1A2B3C4D5E6F700000000005 /* Trouvenir.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Trouvenir.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A2B3C4D5E6F700000000002 /* TrouvenirApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrouvenirApp.swift; sourceTree = "<group>"; };
 		1A2B3C4D5E6F700000000004 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		1A2B3C4D5E6F700000000005 /* Trouvenir.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Trouvenir.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -36,14 +36,6 @@
 			);
 			sourceTree = "<group>";
 		};
-		1A2B3C4D5E6F700000000009 /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				1A2B3C4D5E6F700000000005 /* Trouvenir.app */,
-			);
-			name = Products;
-			sourceTree = "<group>";
-		};
 		1A2B3C4D5E6F700000000008 /* Trouvenir */ = {
 			isa = PBXGroup;
 			children = (
@@ -51,6 +43,14 @@
 				1A2B3C4D5E6F700000000004 /* Assets.xcassets */,
 			);
 			path = Trouvenir;
+			sourceTree = "<group>";
+		};
+		1A2B3C4D5E6F700000000009 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1A2B3C4D5E6F700000000005 /* Trouvenir.app */,
+			);
+			name = Products;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -95,7 +95,7 @@
 			knownRegions = (
 				en,
 				Base,
-				zh-Hans,
+				"zh-Hans",
 			);
 			mainGroup = 1A2B3C4D5E6F700000000007;
 			productRefGroup = 1A2B3C4D5E6F700000000009 /* Products */;
@@ -251,13 +251,15 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = KX2GQ4XDZQ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Trouvenir;
+				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Trouvenir uses the camera to capture travel memories.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Trouvenir uses the microphone to turn spoken travel memories into text.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Trouvenir reads selected photos to create travel memories.";
@@ -266,7 +268,7 @@
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -285,13 +287,15 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_ASSET_PATHS = "";
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = KX2GQ4XDZQ;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Trouvenir;
+				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Trouvenir uses the camera to capture travel memories.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Trouvenir uses the microphone to turn spoken travel memories into text.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Trouvenir reads selected photos to create travel memories.";
@@ -300,7 +304,7 @@
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -318,20 +322,20 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		1A2B3C4D5E6F70000000000F /* Build configuration list for PBXProject "Trouvenir" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				1A2B3C4D5E6F700000000010 /* Debug */,
-				1A2B3C4D5E6F700000000011 /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
 		1A2B3C4D5E6F70000000000B /* Build configuration list for PBXNativeTarget "Trouvenir" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				1A2B3C4D5E6F700000000012 /* Debug */,
 				1A2B3C4D5E6F700000000013 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1A2B3C4D5E6F70000000000F /* Build configuration list for PBXProject "Trouvenir" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A2B3C4D5E6F700000000010 /* Debug */,
+				1A2B3C4D5E6F700000000011 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
