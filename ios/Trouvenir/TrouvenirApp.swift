@@ -21,6 +21,50 @@ private enum RootAppTab: String {
     case identity
 }
 
+private enum TrouvenirAPIEnvironment {
+    private static let localBridgeBaseURL = URL(string: "http://127.0.0.1:3000")!
+    private static let productionBridgeBaseURL = URL(string: "https://trouvenir-api.onrender.com")!
+
+    static var bridgeBaseURL: URL {
+        if let value = ProcessInfo.processInfo.environment["TROUVENIR_BRIDGE_BASE_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !value.isEmpty,
+           let url = URL(string: value) {
+            return url
+        }
+
+        #if DEBUG
+        return localBridgeBaseURL
+        #else
+        return productionBridgeBaseURL
+        #endif
+    }
+
+    static var memoryAIBaseURL: URL {
+        bridgeBaseURL.appending(path: "api/ai")
+    }
+
+    static var tripoBaseURL: URL {
+        bridgeBaseURL.appending(path: "api/tripo")
+    }
+
+    static var appDiagnosticsURL: URL? {
+        #if DEBUG
+        localBridgeBaseURL.appending(path: "debug/app-log")
+        #else
+        nil
+        #endif
+    }
+
+    static var renderDiagnosticsURL: URL? {
+        #if DEBUG
+        localBridgeBaseURL.appending(path: "debug/render-log")
+        #else
+        nil
+        #endif
+    }
+}
+
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var memories: [MemoryProject] = []
@@ -1722,7 +1766,7 @@ final class AppDiagnostics: @unchecked Sendable {
     private let fileManager = FileManager.default
     private let directoryURL: URL
     private let logURL: URL
-    private let bridgeURL: URL
+    private let bridgeURL: URL?
     private let sessionID = UUID().uuidString
     private let maxLogBytes = 512 * 1024
     private let maxLineBytes = 6 * 1024
@@ -1736,10 +1780,10 @@ final class AppDiagnostics: @unchecked Sendable {
             ?? FileManager.default.temporaryDirectory
         directoryURL = caches.appendingPathComponent("TrouvenirDiagnostics", isDirectory: true)
         logURL = directoryURL.appendingPathComponent("app.ndjson")
-        let bridgeValue = ProcessInfo.processInfo.environment["TROUVENIR_APP_DIAGNOSTICS_URL"]
-            ?? "http://127.0.0.1:3000/debug/app-log"
-        bridgeURL = URL(string: bridgeValue)
-            ?? URL(string: "http://127.0.0.1:3000/debug/app-log")!
+        let bridgeValue = ProcessInfo.processInfo.environment["TROUVENIR_APP_DIAGNOSTICS_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        bridgeURL = bridgeValue.flatMap(URL.init(string:))
+            ?? TrouvenirAPIEnvironment.appDiagnosticsURL
     }
 
     var localLogPath: String {
@@ -1846,6 +1890,7 @@ final class AppDiagnostics: @unchecked Sendable {
     }
 
     private func postToBridge(_ data: Data) {
+        guard let bridgeURL else { return }
         var request = URLRequest(url: bridgeURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1999,7 +2044,7 @@ final class ModelRenderDiagnostics: @unchecked Sendable {
     private let fileManager = FileManager.default
     private let directoryURL: URL
     private let logURL: URL
-    private let bridgeURL: URL
+    private let bridgeURL: URL?
     private let maxLogBytes = 768 * 1024
     private let maxLineBytes = 8 * 1024
     private let maxAge: TimeInterval = 7 * 24 * 60 * 60
@@ -2010,10 +2055,10 @@ final class ModelRenderDiagnostics: @unchecked Sendable {
             ?? FileManager.default.temporaryDirectory
         directoryURL = caches.appendingPathComponent("TrouvenirDiagnostics", isDirectory: true)
         logURL = directoryURL.appendingPathComponent("model-viewer.ndjson")
-        let bridgeValue = ProcessInfo.processInfo.environment["TROUVENIR_RENDER_DIAGNOSTICS_URL"]
-            ?? "http://127.0.0.1:3000/debug/render-log"
-        bridgeURL = URL(string: bridgeValue)
-            ?? URL(string: "http://127.0.0.1:3000/debug/render-log")!
+        let bridgeValue = ProcessInfo.processInfo.environment["TROUVENIR_RENDER_DIAGNOSTICS_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        bridgeURL = bridgeValue.flatMap(URL.init(string:))
+            ?? TrouvenirAPIEnvironment.renderDiagnosticsURL
     }
 
     var localLogPath: String {
@@ -2088,6 +2133,7 @@ final class ModelRenderDiagnostics: @unchecked Sendable {
     }
 
     private func postToBridge(_ data: Data) {
+        guard let bridgeURL else { return }
         var request = URLRequest(url: bridgeURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -2620,7 +2666,7 @@ struct ModelViewerWebView: UIViewRepresentable {
                     "htmlBytes": html.utf8.count
                 ]
             )
-            webView.loadHTMLString(html, baseURL: URL(string: "http://127.0.0.1:3000"))
+            webView.loadHTMLString(html, baseURL: TrouvenirAPIEnvironment.bridgeBaseURL)
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -5018,7 +5064,7 @@ struct GeneratedTravelSouvenir: Decodable {
 }
 
 struct MemoryAIClient {
-    private let baseURL = URL(string: "http://127.0.0.1:3000/api/ai")!
+    private let baseURL = TrouvenirAPIEnvironment.memoryAIBaseURL
 
     func generateMemory(_ input: TravelMemoryAIRequest) async throws -> GeneratedTravelMemory {
         var request = URLRequest(url: baseURL.appending(path: "memory"))
@@ -5065,7 +5111,7 @@ enum MemoryAIError: LocalizedError {
 }
 
 struct TripoAPIClient {
-    private let baseURL = URL(string: "http://127.0.0.1:3000/api/tripo")!
+    private let baseURL = TrouvenirAPIEnvironment.tripoBaseURL
 
     func proxiedModelURL(for modelURL: URL) -> URL {
         var components = URLComponents(

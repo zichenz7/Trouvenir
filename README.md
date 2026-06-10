@@ -149,22 +149,22 @@ TROUVENIR_ENABLE_DEBUG_ENDPOINTS=0
 After deployment, verify the public service:
 
 ```bash
-curl https://your-render-service.onrender.com/health
+curl https://trouvenir-api.onrender.com/health
 ```
 
-Then update the iOS app's production API base URL from `http://127.0.0.1:3000` to the HTTPS service URL before archiving for TestFlight.
+The iOS app uses `http://127.0.0.1:3000` in Debug builds and `https://trouvenir-api.onrender.com` in Release/TestFlight builds. To temporarily point any build at another bridge, set the `TROUVENIR_BRIDGE_BASE_URL` launch environment variable.
 
 ## Run the iOS app with DeepSeek and Tripo
 
 The iOS app calls this local bridge instead of calling DeepSeek or Tripo directly, so API keys stay off the device.
 
-1. Start the bridge:
+1. For local Debug development, start the bridge:
 
 ```bash
 npm run dev
 ```
 
-2. Open `ios/Trouvenir.xcodeproj` in Xcode and run the `Trouvenir` scheme on an iOS Simulator.
+2. Open `ios/Trouvenir.xcodeproj` in Xcode and run the `Trouvenir` scheme on an iOS Simulator. Release/TestFlight builds use the deployed Render bridge instead.
 
 3. In the `创造` tab, first tap `下一步`. This calls `/api/ai/memory`, which asks DeepSeek to return structured JSON for the destination, title, identity card, story, and souvenir candidates.
 
@@ -201,7 +201,7 @@ Souvenir generation constraints:
 - Avoid complex tasks such as generating a full scene, multiple people, water areas, broad landscapes, postcard backdrops, or large terrain slabs.
 - Convert broad memories into one subject category first. For example, choose `一个地标局部` for a landmark detail, `一个人物主体` for a traveler pose, `一个交通工具` for a ride, or `一个随身物件` for an object from the trip. Add destination-specific detail only after the category is clear.
 
-The app currently points to `http://localhost:3000/api/tripo`, which works for the iOS Simulator. For a physical iPhone, change `baseURL` in `TripoAPIClient` to your Mac LAN address, such as `http://192.168.1.23:3000/api/tripo`.
+The app centralizes bridge selection in `TrouvenirAPIEnvironment`: Debug defaults to the local bridge, while Release/TestFlight defaults to the Render bridge.
 
 ## API
 
