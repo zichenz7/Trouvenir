@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: trouvenir-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_BASE_URL
+        value: https://api.deepseek.com
+      - key: DEEPSEEK_MODEL
+        value: deepseek-v4-flash
+      - key: TRIPO_API_KEY
+        sync: false
+      - key: TRIPO_BASE_URL
+        value: https://api.tripo3d.ai/v2/openapi
+      - key: TROUVENIR_ENABLE_DEBUG_ENDPOINTS
+        value: "0"

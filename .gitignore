@@ -1,0 +1,35 @@
+node_modules/
+dist/
+.env
+.DS_Store
+uploads/
+output/
+
+artifacts/
+
+# Local/generated files
+artifacts/
+dist/
+node_modules/
+.DS_Store
+*.xcuserstate
+ios/**/xcuserdata/
+
+# Older web prototype
+web/
+src/
+design-qa.md
+xiaohongshu-preheat-trouvenir.md
+docs/render-diagnostics.md
+
+# Codex/local project notes
+AGENTS.md
+
+# Older web prototype scripts
+scripts/build-web.mjs
+scripts/e2e-3d-render.mjs
+scripts/ensure-local-public-assets.mjs
+scripts/generate-placeholder-models.mjs
+scripts/hydrate-dist-assets.mjs
+scripts/serve-static.mjs
+tsconfig.json
