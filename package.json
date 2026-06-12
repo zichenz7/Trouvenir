@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node scripts/tripo-bridge-server.mjs",
+    "dev": "HOST=0.0.0.0 node scripts/tripo-bridge-server.mjs",
     "start": "node scripts/tripo-bridge-server.mjs",
     "web:dev": "vite --config web/vite.config.js --host 127.0.0.1",
     "web:build": "node scripts/ensure-local-public-assets.mjs && vite build --config web/vite.config.js && node scripts/hydrate-dist-assets.mjs",

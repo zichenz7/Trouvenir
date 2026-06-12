@@ -28,6 +28,8 @@ Useful event families:
 - `collection.tab.changed`: collection shelf tab switching.
 - `identity.archive.appear`: profile archive list opening for countries, cities, or memories.
 - `location.resolve`: destination-to-city/country decisions, including raw input, normalized key, matched rule, output city, output country, and call site.
+- `location.ai.resolve.*`, `location.cache.updated`: DeepSeek-backed location normalization for destinations that are not covered by deterministic rules.
+- `location.country.resolve.ai.*`: country archive results that came from the DeepSeek location cache instead of CLGeocoder.
 - `location.country.resolve.start`, `location.country.resolve.geocode.*`: country resolver work, CLGeocoder fallback results, and rejected low-confidence geocoder matches.
 - `debug.memory.seeded`: Debug-only simulator fixture used for deterministic E2E reproduction.
 
@@ -49,9 +51,33 @@ tail -n 240 artifacts/ios-app-diagnostics/app.ndjson | jq -c 'select(.event=="lo
 - `data.country`: the known country used before CLGeocoder fallback.
 - `call`: which view or resolver asked for the mapping.
 
-4. If `data.rule` is `fallback.destination`, add or adjust a deterministic rule in `TravelArchive` before relying on CLGeocoder. Short landmark names and English island/place names can geocode to the wrong country.
-5. If a `location.country.resolve.geocode.rejected` event appears, the app intentionally ignored a low-confidence CLGeocoder match. For Latin-letter place names, the placemark must contain a core token from the original query before the country is accepted.
-6. If a `location.country.resolve.geocode.success` event disagrees with the deterministic rule, keep the deterministic rule authoritative and treat the geocoder result as suspect evidence.
+4. If `data.rule` is `fallback.destination`, check for a nearby `location.ai.resolve.success`. This means the app used DeepSeek to normalize a long-tail place and cached the city/country result.
+5. If `location.ai.resolve.error` appears, inspect the bridge `/api/ai/location` path, DeepSeek config, and network logs before adding another local rule.
+6. If `location.ai.resolve.unusable` appears, DeepSeek returned low confidence or no country. Add a deterministic rule for high-value regressions, then keep CLGeocoder as the last fallback.
+7. If a `location.country.resolve.geocode.rejected` event appears, the app intentionally ignored a low-confidence CLGeocoder match. For Latin-letter place names, the placemark must contain a core token from the original query before the country is accepted.
+8. If a `location.country.resolve.geocode.success` event disagrees with the deterministic or DeepSeek rule, keep the deterministic/DeepSeek result authoritative and treat the geocoder result as suspect evidence.
+
+## DeepSeek Location Resolver
+
+The bridge exposes a dedicated location resolver:
+
+```bash
+curl -s http://127.0.0.1:3000/api/ai/location \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"哈利法塔"}' | jq
+```
+
+Expected healthy shape:
+
+```json
+{"cityName":"迪拜","countryName":"阿联酋","regionCode":"AE","confidence":"high","reason":"哈利法塔位于迪拜"}
+```
+
+The iOS archive resolver uses this order:
+
+1. deterministic `TravelArchive` rules for known regressions and high-confidence landmarks;
+2. DeepSeek `/api/ai/location` for long-tail user input;
+3. CLGeocoder only as the final fallback, with rejection rules for suspicious matches.
 
 ## Simulator Repro Seed
 

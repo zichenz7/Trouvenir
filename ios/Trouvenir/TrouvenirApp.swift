@@ -1,7 +1,5 @@
-import AVFoundation
 import CoreLocation
 import PhotosUI
-import Speech
 import SwiftUI
 import UIKit
 import WebKit
@@ -15,6 +13,13 @@ struct TrouvenirApp: App {
     }
 }
 
+extension UIApplication {
+    @MainActor
+    func dismissKeyboard() {
+        sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
+
 private enum RootAppTab: String {
     case create
     case collection
@@ -22,8 +27,9 @@ private enum RootAppTab: String {
 }
 
 private enum TrouvenirAPIEnvironment {
-    private static let localBridgeBaseURL = URL(string: "http://127.0.0.1:3000")!
-    private static let productionBridgeBaseURL = URL(string: "https://trouvenir-api.onrender.com")!
+    private static let localBridgeBaseURL = URL(string: "http://10.0.4.154:3000")!
+    private static let localDiagnosticsBaseURL = URL(string: "http://10.0.4.154:3000")!
+    private static let productionBridgeBaseURL = URL(string: "https://api-souvenir-lqbumpvbta.cn-hongkong.fcapp.run")!
 
     static var bridgeBaseURL: URL {
         if let value = ProcessInfo.processInfo.environment["TROUVENIR_BRIDGE_BASE_URL"]?
@@ -33,14 +39,22 @@ private enum TrouvenirAPIEnvironment {
             return url
         }
 
-        #if DEBUG
+#if DEBUG
+        #if targetEnvironment(simulator)
         return localBridgeBaseURL
         #else
         return productionBridgeBaseURL
         #endif
+#else
+        return productionBridgeBaseURL
+#endif
     }
 
     static var memoryAIBaseURL: URL {
+        bridgeBaseURL.appending(path: "api/ai")
+    }
+
+    static var locationAIBaseURL: URL {
         bridgeBaseURL.appending(path: "api/ai")
     }
 
@@ -50,7 +64,7 @@ private enum TrouvenirAPIEnvironment {
 
     static var appDiagnosticsURL: URL? {
         #if DEBUG
-        localBridgeBaseURL.appending(path: "debug/app-log")
+        localDiagnosticsBaseURL.appending(path: "debug/app-log")
         #else
         nil
         #endif
@@ -58,25 +72,57 @@ private enum TrouvenirAPIEnvironment {
 
     static var renderDiagnosticsURL: URL? {
         #if DEBUG
-        localBridgeBaseURL.appending(path: "debug/render-log")
+        localDiagnosticsBaseURL.appending(path: "debug/render-log")
         #else
         nil
         #endif
     }
 }
 
+private enum TrouvenirURLSessions {
+    static let bridge: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [
+            "HTTPEnable": false,
+            "HTTPSEnable": false,
+            "SOCKSEnable": false,
+            "ProxyAutoConfigEnable": false
+        ]
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 180
+        return URLSession(configuration: configuration)
+    }()
+}
+
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @State private var memories: [MemoryProject] = []
+    @State private var memories: [MemoryProject]
+    @State private var memoryStoreLoadError: String?
+    @State private var transientMemoryIDs: Set<UUID> = []
+    @State private var activeTripoMemoryIDs: Set<UUID> = []
+    @State private var tripoErrorsByMemoryID: [UUID: String] = [:]
     @State private var selectedTab: RootAppTab = .create
     @State private var debugModelViewerURL: URL?
     @State private var didOpenDebugModel = false
     private let tripoClient = TripoAPIClient()
 
+    init() {
+        let loadResult = TravelMemoryStore.load()
+        _memories = State(initialValue: loadResult.memories)
+        _memoryStoreLoadError = State(initialValue: loadResult.errorDescription)
+    }
+
     var body: some View {
         TabView(selection: $selectedTab) {
             MemoryStudioView(
                 memories: $memories,
+                persistMemories: {
+                    persistMemories(reason: "memory_studio.changed")
+                },
+                createSouvenir: { memory in
+                    startTripoGeneration(for: memory.id, switchToCollection: true)
+                },
                 openCollection: {
                     withAnimation(.snappy) {
                         selectedTab = .collection
@@ -88,7 +134,14 @@ struct ContentView: View {
                 }
                 .tag(RootAppTab.create)
 
-            CollectionView(memories: memories)
+            CollectionView(
+                memories: $memories,
+                activeTripoMemoryIDs: activeTripoMemoryIDs,
+                tripoErrorsByMemoryID: tripoErrorsByMemoryID,
+                generateSouvenir: { memoryID in
+                    startTripoGeneration(for: memoryID, switchToCollection: false)
+                }
+            )
                 .tabItem {
                     Label("收藏馆", systemImage: "square.grid.2x2.fill")
                 }
@@ -120,6 +173,8 @@ struct ContentView: View {
                 "app.appear",
                 data: [
                     "memoryCount": memories.count,
+                    "memoryStorePath": TravelMemoryStore.filePath,
+                    "memoryStoreLoadError": memoryStoreLoadError ?? "",
                     "appLogPath": AppDiagnostics.shared.localLogPath
                 ]
             )
@@ -142,7 +197,282 @@ struct ContentView: View {
                 "app.scenePhase.changed",
                 data: ["phase": String(describing: phase)]
             )
+            if phase == .background {
+                persistMemories(reason: "scene.background")
+            }
         }
+    }
+
+    private var persistableMemories: [MemoryProject] {
+        memories.filter { !transientMemoryIDs.contains($0.id) }
+    }
+
+    private func persistMemories(reason: String) {
+        guard memoryStoreLoadError == nil else {
+            AppDiagnostics.shared.record(
+                "memory.store.save.skipped",
+                level: "error",
+                data: [
+                    "reason": reason,
+                    "loadError": memoryStoreLoadError ?? "",
+                    "memoryCount": memories.count,
+                    "path": TravelMemoryStore.filePath
+                ]
+            )
+            return
+        }
+
+        do {
+            try TravelMemoryStore.save(persistableMemories)
+            AppDiagnostics.shared.record(
+                "memory.store.save.success",
+                data: [
+                    "reason": reason,
+                    "memoryCount": persistableMemories.count,
+                    "path": TravelMemoryStore.filePath
+                ],
+                dedupeKey: "memory.store.save.success:\(reason):\(persistableMemories.count)"
+            )
+        } catch {
+            AppDiagnostics.shared.record(
+                "memory.store.save.error",
+                level: "error",
+                data: [
+                    "reason": reason,
+                    "message": error.localizedDescription,
+                    "path": TravelMemoryStore.filePath
+                ]
+            )
+        }
+    }
+
+    @MainActor
+    private func startTripoGeneration(for memoryID: UUID, switchToCollection: Bool) {
+        guard !activeTripoMemoryIDs.contains(memoryID),
+              memories.contains(where: { $0.id == memoryID }) else {
+            if switchToCollection {
+                withAnimation(.snappy) {
+                    selectedTab = .collection
+                }
+            }
+            return
+        }
+
+        activeTripoMemoryIDs.insert(memoryID)
+        tripoErrorsByMemoryID[memoryID] = nil
+
+        if switchToCollection {
+            withAnimation(.snappy) {
+                selectedTab = .collection
+            }
+        }
+
+        Task {
+            await generateTripoSouvenir(for: memoryID)
+        }
+    }
+
+    @MainActor
+    private func generateTripoSouvenir(for memoryID: UUID) async {
+        guard let memory = memories.first(where: { $0.id == memoryID }) else {
+            activeTripoMemoryIDs.remove(memoryID)
+            return
+        }
+
+        ModelRenderDiagnostics.shared.record(
+            "collection.tripo.generate.start",
+            data: [
+                "memoryID": memoryID.uuidString,
+                "destination": memory.destination,
+                "promptLength": TripoSouvenirPromptFactory.prompt(for: memory).count,
+                "negativePromptLength": TripoSouvenirPromptFactory.negativePrompt(for: memory).count
+            ]
+        )
+
+        do {
+            let taskID: String
+            if let existingTask = memory.tripoTask, !existingTask.isFinal {
+                taskID = existingTask.taskID
+                ModelRenderDiagnostics.shared.record(
+                    "collection.tripo.task.resume",
+                    data: [
+                        "memoryID": memoryID.uuidString,
+                        "taskID": taskID,
+                        "status": existingTask.status,
+                        "progress": existingTask.progress ?? -1
+                    ]
+                )
+            } else {
+                taskID = try await tripoClient.createTextToModelTask(
+                    prompt: TripoSouvenirPromptFactory.prompt(for: memory),
+                    negativePrompt: TripoSouvenirPromptFactory.negativePrompt(for: memory)
+                )
+                updateMemory(memoryID, tripoTask: .placeholder(taskID: taskID), reason: "collection.tripo.task.created")
+                ModelRenderDiagnostics.shared.record(
+                    "collection.tripo.task.created",
+                    data: [
+                        "memoryID": memoryID.uuidString,
+                        "taskID": taskID
+                    ]
+                )
+            }
+
+            let completedTask = try await pollTripoTask(taskID, memoryID: memoryID)
+            updateMemory(memoryID, tripoTask: completedTask, reason: "collection.tripo.task.completed")
+            tripoErrorsByMemoryID[memoryID] = nil
+            ModelRenderDiagnostics.shared.record(
+                "collection.tripo.task.completed",
+                data: [
+                    "memoryID": memoryID.uuidString,
+                    "taskID": completedTask.taskID,
+                    "status": completedTask.status,
+                    "progress": completedTask.progress ?? -1,
+                    "modelURL": completedTask.modelURL?.absoluteString ?? "",
+                    "renderedImageURL": completedTask.renderedImageURL?.absoluteString ?? ""
+                ]
+            )
+        } catch {
+            let userMessage = userFacingTripoError(error)
+            tripoErrorsByMemoryID[memoryID] = userMessage
+            ModelRenderDiagnostics.shared.record(
+                "collection.tripo.generate.error",
+                level: "error",
+                data: diagnosticErrorData(
+                    error,
+                    userMessage: userMessage,
+                    extra: ["memoryID": memoryID.uuidString]
+                )
+            )
+        }
+
+        activeTripoMemoryIDs.remove(memoryID)
+    }
+
+    @MainActor
+    private func pollTripoTask(_ taskID: String, memoryID: UUID) async throws -> TripoTask {
+        var lastTask = memories.first(where: { $0.id == memoryID })?.tripoTask ?? TripoTask.placeholder(taskID: taskID)
+        var lastLoggedProgress = lastTask.progress ?? -1
+        var consecutiveFailures = 0
+
+        for pollIndex in 0..<180 {
+            do {
+                let task = try await tripoClient.fetchTask(taskID: taskID)
+                consecutiveFailures = 0
+                lastTask = task
+                updateMemory(memoryID, tripoTask: task, reason: "collection.tripo.task.poll")
+                let currentProgress = task.progress ?? -1
+                if task.isFinal || abs(currentProgress - lastLoggedProgress) >= 10 {
+                    ModelRenderDiagnostics.shared.record(
+                        "collection.tripo.task.poll",
+                        data: [
+                            "memoryID": memoryID.uuidString,
+                            "taskID": task.taskID,
+                            "status": task.status,
+                            "progress": currentProgress,
+                            "pollIndex": pollIndex
+                        ]
+                    )
+                    lastLoggedProgress = currentProgress
+                }
+
+                if task.isFinal {
+                    return task
+                }
+
+                try await Task.sleep(for: .seconds(3))
+            } catch {
+                consecutiveFailures += 1
+                let retryDelaySeconds = min(18, max(3, consecutiveFailures * 3))
+                ModelRenderDiagnostics.shared.record(
+                    "collection.tripo.task.poll.error",
+                    level: consecutiveFailures >= 8 ? "error" : "warn",
+                    data: [
+                        "memoryID": memoryID.uuidString,
+                        "taskID": taskID,
+                        "pollIndex": pollIndex,
+                        "consecutiveFailures": consecutiveFailures,
+                        "retryDelaySeconds": retryDelaySeconds,
+                        "message": userFacingTripoError(error)
+                    ]
+                )
+
+                if consecutiveFailures >= 8 {
+                    throw error
+                }
+
+                try await Task.sleep(for: .seconds(retryDelaySeconds))
+            }
+        }
+
+        ModelRenderDiagnostics.shared.record(
+            "collection.tripo.task.poll.timeout",
+            level: "error",
+            data: [
+                "memoryID": memoryID.uuidString,
+                "taskID": taskID,
+                "status": lastTask.status,
+                "progress": lastTask.progress ?? -1
+            ]
+        )
+        throw TripoAPIError.server("3D 纪念品仍在生成，请稍后继续检查生成进度。")
+    }
+
+    private func updateMemory(_ memoryID: UUID, tripoTask: TripoTask, reason: String) {
+        guard let index = memories.firstIndex(where: { $0.id == memoryID }) else { return }
+        memories[index] = memories[index].updated(tripoTask: tripoTask)
+        persistMemories(reason: reason)
+    }
+
+    private func userFacingTripoError(_ error: Error) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .notConnectedToInternet, .timedOut:
+                return "本地生成服务未启动，请先在 Mac 终端运行 npm run dev"
+            default:
+                break
+            }
+        }
+
+        let message = error.localizedDescription
+        if message.localizedCaseInsensitiveContains("api.tripo3d.ai")
+            || message.localizedCaseInsensitiveContains("curl:")
+            || message.localizedCaseInsensitiveContains("could not resolve host") {
+            return "阿里云桥接服务暂时无法连接 Tripo OpenAPI。请检查阿里云函数地域、出站网络或代理配置。"
+        }
+
+        if message.localizedCaseInsensitiveContains("network request failed")
+            || message.localizedCaseInsensitiveContains("connection reset")
+            || message.localizedCaseInsensitiveContains("recv failure")
+            || message.localizedCaseInsensitiveContains("timed out") {
+            return "生成服务网络短暂中断，进度已保留。请稍后点“继续检查生成进度”。"
+        }
+
+        if message.localizedCaseInsensitiveContains("not enough credit")
+            || message.localizedCaseInsensitiveContains("2010") {
+            return "Tripo OpenAPI 钱包余额不足。Studio 里的会员 credits 和 API credits 不共享，请在 API Billing 页充值后再生成。"
+        }
+
+        return message
+    }
+
+    private func diagnosticErrorData(_ error: Error, userMessage: String, extra: [String: Any] = [:]) -> [String: Any] {
+        var data: [String: Any] = [
+            "message": userMessage,
+            "rawDescription": String(describing: error),
+            "localizedDescription": error.localizedDescription
+        ]
+
+        if let urlError = error as? URLError {
+            data["urlErrorCode"] = urlError.errorCode
+            data["urlErrorName"] = "\(urlError.code)"
+            data["failingURL"] = urlError.failureURLString ?? ""
+        }
+
+        extra.forEach { key, value in
+            data[key] = value
+        }
+
+        return data
     }
 
     private func seedDebugMemoriesIfRequested() {
@@ -178,6 +508,7 @@ struct ContentView: View {
             accent: .trouvenirTeal
         )
         memories.append(seededMemory)
+        transientMemoryIDs.insert(seededMemory.id)
         AppDiagnostics.shared.record(
             "debug.memory.seeded",
             data: [
@@ -263,7 +594,7 @@ enum CreationStage: Int, CaseIterable {
     var title: String {
         switch self {
         case .memory:
-            return "描述"
+            return "创建"
         case .subject:
             return "确认"
         case .model:
@@ -274,7 +605,7 @@ enum CreationStage: Int, CaseIterable {
     var subtitle: String {
         switch self {
         case .memory:
-            return "用一句话说清楚这次旅行"
+            return "保存后在收藏馆自动制作 3D 纪念品和旅行故事"
         case .subject:
             return "默认生成人物主体"
         case .model:
@@ -285,6 +616,8 @@ enum CreationStage: Int, CaseIterable {
 
 struct MemoryStudioView: View {
     @Binding var memories: [MemoryProject]
+    let persistMemories: () -> Void
+    let createSouvenir: (MemoryProject) -> Void
     let openCollection: () -> Void
 
     @State private var creationStage: CreationStage = .memory
@@ -301,6 +634,7 @@ struct MemoryStudioView: View {
     @State private var tripoSubjectCategory = "人物"
     @State private var tripoSubjectDetail = ""
     @State private var selectedItems: [PhotosPickerItem] = []
+    @State private var importedPhotos: [ImportedTravelPhoto] = []
     @State private var generatedMemory: MemoryProject?
     @State private var isGeneratingMemory = false
     @State private var isGenerating3D = false
@@ -317,133 +651,41 @@ struct MemoryStudioView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    HeroHeader()
-
                     CreationStepHeader(stage: creationStage)
 
-                    switch creationStage {
-                    case .memory:
-                        MemoryPromptStep(
-                            prompt: $memoryPrompt,
-                            destination: $destination,
-                            tripTitle: $tripTitle,
-                            companions: $companions,
-                            feeling: $feeling,
-                            selectedItems: $selectedItems,
-                            showAdvanced: $showAdvancedTripDetails,
-                            isGenerating: isGeneratingMemory,
-                            progress: progress,
-                            currentStep: currentStep,
-                            errorMessage: memoryError,
-                            action: {
-                                Task {
-                                    await generateMemory()
-                                }
+                    MemoryPromptStep(
+                        prompt: $memoryPrompt,
+                        tripoSubjectCategory: $tripoSubjectCategory,
+                        tripoSubjectDetail: $tripoSubjectDetail,
+                        showSubjectTypes: $showAdvancedSubjectOptions,
+                        selectedItems: $selectedItems,
+                        importedPhotos: $importedPhotos,
+                        showAdvanced: $showAdvancedTripDetails,
+                        isGenerating: isGeneratingMemory,
+                        progress: progress,
+                        currentStep: currentStep,
+                        errorMessage: memoryError,
+                        action: {
+                            Task {
+                                await generateMemory()
                             }
-                        )
-
-                    case .subject:
-                        if let generatedMemory {
-                            CompactMemorySummary(memory: generatedMemory)
                         }
-
-                        SouvenirSubjectQuestionPanel(
-                            category: $tripoSubjectCategory,
-                            detail: $tripoSubjectDetail,
-                            showAdvanced: $showAdvancedSubjectOptions
-                        )
-
-                        VStack(spacing: 10) {
-                            Toggle(isOn: $notifyWhenModelReady) {
-                                Text("生成完成时提醒我")
-                                    .font(.subheadline)
-                            }
-                            .tint(Color.trouvenirTeal)
-
-                            Button {
-                                Task {
-                                    await generateTripoSouvenir()
-                                }
-                            } label: {
-                                Label("开始生成 3D 纪念品", systemImage: "cube.transparent")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(Color.trouvenirInk)
-                            .disabled(isGenerating3D || normalizedTripoSubject.isEmpty)
-
-                            Button("返回修改旅行描述") {
-                                withAnimation(.snappy) {
-                                    creationStage = .memory
-                                }
-                            }
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
-                            Button("新建旅行") {
-                                startNewTravel()
-                            }
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(Color.trouvenirTeal)
-                        }
-
-                    case .model:
-                        TripoModelPanel(
-                            task: tripoTask,
-                            errorMessage: tripoError,
-                            memoryGenerated: generatedMemory != nil,
-                            hasSubject: !normalizedTripoSubject.isEmpty,
-                            isGenerating: isGenerating3D,
-                            openModel: { url in
-                                let proxiedURL = tripoClient.proxiedModelURL(for: url)
-                                ModelRenderDiagnostics.shared.recordModelOpen(
-                                    source: "memory_studio",
-                                    modelURL: url,
-                                    proxiedURL: proxiedURL
-                                )
-                                modelViewerURL = proxiedURL
-                            },
-                            action: {
-                                Task {
-                                    await generateTripoSouvenir()
-                                }
-                            }
-                        )
-
-                        Button {
-                            startNewTravel()
-                        } label: {
-                            Label("新建旅行", systemImage: "plus")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(Color.trouvenirTeal)
-
-                        GenerationArchiveSummary(
-                            memory: generatedMemory,
-                            task: tripoTask,
-                            openCollection: openCollection
-                        )
-                    }
+                    )
                 }
                 .padding(20)
             }
+            .scrollDismissesKeyboard(.interactively)
             .background(Color.trouvenirCanvas)
             .navigationTitle("Trouvenir")
             .navigationBarTitleDisplayMode(.inline)
-        }
-        .sheet(
-            isPresented: Binding(
-                get: { modelViewerURL != nil },
-                set: { isPresented in
-                    if !isPresented {
-                        modelViewerURL = nil
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("完成") {
+                        UIApplication.shared.dismissKeyboard()
                     }
+                    .font(.subheadline.weight(.semibold))
                 }
-            )
-        ) {
-            if let modelViewerURL {
-                ModelViewerSheet(modelURL: modelViewerURL)
             }
         }
         .alert("生成完成", isPresented: Binding(
@@ -466,8 +708,6 @@ struct MemoryStudioView: View {
 
         isGeneratingMemory = true
         memoryError = nil
-        tripoTask = nil
-        tripoError = nil
         tripoSubjectCategory = "人物"
         tripoSubjectDetail = ""
         progress = 0.08
@@ -507,15 +747,19 @@ struct MemoryStudioView: View {
             }
 
             let memory = generated.memoryProject(photoCount: max(selectedItems.count, 6))
+                .updated(
+                    tripoSubjectCategory: tripoSubjectCategory,
+                    tripoSubjectDetail: tripoSubjectDetail
+                )
             generatedMemory = memory
             memories.append(memory)
+            persistMemories()
 
-            currentStep = "旅行记忆已生成，可选择继续生成 3D 纪念品"
+            currentStep = "已保存到收藏馆，正在制作 3D 纪念品"
             progress = 1.0
             isGeneratingMemory = false
-            withAnimation(.snappy) {
-                creationStage = .subject
-            }
+            createSouvenir(memory)
+            startNewTravel()
         } catch {
             memoryError = userFacingMemoryError(error)
             currentStep = "旅行记忆生成失败"
@@ -598,7 +842,10 @@ struct MemoryStudioView: View {
             ModelRenderDiagnostics.shared.record(
                 "tripo.generate.error",
                 level: "error",
-                data: ["message": tripoError ?? String(describing: error)]
+                data: diagnosticErrorData(
+                    error,
+                    userMessage: tripoError ?? String(describing: error)
+                )
             )
         }
 
@@ -623,6 +870,7 @@ struct MemoryStudioView: View {
 
         if let index = memories.firstIndex(where: { $0.id == memory.id }) {
             memories[index] = updatedMemory
+            persistMemories()
         }
     }
 
@@ -641,6 +889,7 @@ struct MemoryStudioView: View {
         tripoSubjectCategory = "人物"
         tripoSubjectDetail = ""
         selectedItems = []
+        importedPhotos = []
         generatedMemory = nil
         isGeneratingMemory = false
         isGenerating3D = false
@@ -746,11 +995,17 @@ struct MemoryStudioView: View {
         }
 
         let message = error.localizedDescription
+        if message.localizedCaseInsensitiveContains("api.tripo3d.ai")
+            || message.localizedCaseInsensitiveContains("curl:")
+            || message.localizedCaseInsensitiveContains("could not resolve host") {
+            return "阿里云桥接服务暂时无法连接 Tripo OpenAPI。请检查阿里云函数地域、出站网络或代理配置。"
+        }
+
         if message.localizedCaseInsensitiveContains("network request failed")
             || message.localizedCaseInsensitiveContains("connection reset")
             || message.localizedCaseInsensitiveContains("recv failure")
             || message.localizedCaseInsensitiveContains("timed out") {
-            return "生成服务网络短暂中断，任务已保留。请稍后点“继续检查 3D 任务”。"
+            return "生成服务网络短暂中断，进度已保留。请稍后点“继续检查生成进度”。"
         }
 
         if message.localizedCaseInsensitiveContains("not enough credit")
@@ -759,6 +1014,22 @@ struct MemoryStudioView: View {
         }
 
         return message
+    }
+
+    private func diagnosticErrorData(_ error: Error, userMessage: String) -> [String: Any] {
+        var data: [String: Any] = [
+            "message": userMessage,
+            "rawDescription": String(describing: error),
+            "localizedDescription": error.localizedDescription
+        ]
+
+        if let urlError = error as? URLError {
+            data["urlErrorCode"] = urlError.errorCode
+            data["urlErrorName"] = "\(urlError.code)"
+            data["failingURL"] = urlError.failureURLString ?? ""
+        }
+
+        return data
     }
 
     private var effectiveDestination: String {
@@ -957,24 +1228,7 @@ struct MemoryStudioView: View {
                 "progress": lastTask.progress ?? -1
             ]
         )
-        throw TripoAPIError.server("3D 任务仍在生成，请稍后点击继续检查任务状态。")
-    }
-}
-
-struct HeroHeader: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("把旅行变成可以收藏的人生纪念品")
-                .font(.system(size: 28, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.trouvenirInk)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text("一句话开始，逐步生成旅行记忆和 3D 纪念品。")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.vertical, 8)
+        throw TripoAPIError.server("3D 纪念品仍在生成，请稍后继续检查生成进度。")
     }
 }
 
@@ -982,20 +1236,10 @@ struct CreationStepHeader: View {
     let stage: CreationStage
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                ForEach(CreationStage.allCases, id: \.self) { item in
-                    VStack(spacing: 6) {
-                        Text(item.title)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(item.rawValue <= stage.rawValue ? Color.trouvenirInk : Color.secondary)
-
-                        Capsule()
-                            .fill(item.rawValue <= stage.rawValue ? Color.trouvenirTeal.opacity(0.72) : Color.black.opacity(0.08))
-                            .frame(height: 4)
-                    }
-                }
-            }
+        VStack(alignment: .leading, spacing: 8) {
+            Text("创建旅行纪念品")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(Color.trouvenirInk)
 
             Text(stage.subtitle)
                 .font(.subheadline)
@@ -1045,6 +1289,10 @@ struct LabeledTextField: View {
 
             TextField(title, text: $text)
                 .textInputAutocapitalization(.never)
+                .submitLabel(.done)
+                .onSubmit {
+                    UIApplication.shared.dismissKeyboard()
+                }
                 .padding(13)
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
         }
@@ -1053,6 +1301,9 @@ struct LabeledTextField: View {
 
 struct PhotoImportStrip: View {
     @Binding var selectedItems: [PhotosPickerItem]
+    @Binding var importedPhotos: [ImportedTravelPhoto]
+    @State private var activePhotoID: ImportedTravelPhoto.ID?
+    @State private var isLoadingPhotos = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1072,28 +1323,228 @@ struct PhotoImportStrip: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
-                    ForEach(0..<max(selectedItems.count, 5), id: \.self) { index in
-                        PhotoSlot(index: index, isFilled: index < selectedItems.count)
+                    ForEach(Array(importedPhotos.enumerated()), id: \.element.id) { index, photo in
+                        ImportedPhotoSlot(
+                            photo: photo,
+                            index: index,
+                            openAction: {
+                                activePhotoID = photo.id
+                            },
+                            deleteAction: {
+                                removePhoto(at: index)
+                            }
+                        )
+                    }
+
+                    if isLoadingPhotos {
+                        LoadingPhotoSlot()
+                    }
+
+                    ForEach(0..<max(5 - importedPhotos.count - (isLoadingPhotos ? 1 : 0), 0), id: \.self) { index in
+                        EmptyPhotoSlot(index: importedPhotos.count + index)
                     }
                 }
                 .padding(.vertical, 2)
             }
+
         }
+        .onAppear {
+            Task {
+                await syncImportedPhotos(with: selectedItems)
+            }
+        }
+        .onChange(of: selectedItems) { _, items in
+            Task {
+                await syncImportedPhotos(with: items)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { activePhotoID != nil },
+            set: { isPresented in
+                if !isPresented {
+                    activePhotoID = nil
+                }
+            }
+        )) {
+            if let photoBinding = activePhotoBinding,
+               let index = importedPhotos.firstIndex(where: { $0.id == activePhotoID }) {
+                PhotoPreviewEditorSheet(
+                    photo: photoBinding,
+                    position: index + 1,
+                    totalCount: importedPhotos.count,
+                    replaceAction: { item in
+                        await replacePhoto(at: index, with: item)
+                    },
+                    deleteAction: {
+                        removePhoto(at: index)
+                        activePhotoID = nil
+                    }
+                )
+            }
+        }
+    }
+
+    private var activePhotoBinding: Binding<ImportedTravelPhoto>? {
+        guard let activePhotoID,
+              let index = importedPhotos.firstIndex(where: { $0.id == activePhotoID }) else {
+            return nil
+        }
+
+        return Binding(
+            get: { importedPhotos[index] },
+            set: { importedPhotos[index] = $0 }
+        )
+    }
+
+    @MainActor
+    private func syncImportedPhotos(with items: [PhotosPickerItem]) async {
+        guard !items.isEmpty else {
+            importedPhotos = []
+            isLoadingPhotos = false
+            return
+        }
+
+        isLoadingPhotos = true
+        var nextPhotos: [ImportedTravelPhoto] = []
+
+        for (index, item) in items.enumerated() {
+            if let identifier = item.itemIdentifier,
+               let existingPhoto = importedPhotos.first(where: { $0.itemIdentifier == identifier }) {
+                nextPhotos.append(existingPhoto)
+                continue
+            }
+
+            if index < importedPhotos.count,
+               importedPhotos[index].itemIdentifier == item.itemIdentifier {
+                nextPhotos.append(importedPhotos[index])
+                continue
+            }
+
+            if let photo = await Self.importPhoto(from: item) {
+                nextPhotos.append(photo)
+            }
+        }
+
+        importedPhotos = nextPhotos
+        isLoadingPhotos = false
+    }
+
+    @MainActor
+    private func replacePhoto(at index: Int, with item: PhotosPickerItem) async {
+        guard importedPhotos.indices.contains(index),
+              let photo = await Self.importPhoto(from: item) else {
+            return
+        }
+
+        if selectedItems.indices.contains(index) {
+            selectedItems[index] = item
+        }
+        importedPhotos[index] = photo
+    }
+
+    private func removePhoto(at index: Int) {
+        guard importedPhotos.indices.contains(index) else { return }
+
+        importedPhotos.remove(at: index)
+        if selectedItems.indices.contains(index) {
+            selectedItems.remove(at: index)
+        }
+
+        if importedPhotos.first(where: { $0.id == activePhotoID }) == nil {
+            activePhotoID = nil
+        }
+    }
+
+    private static func importPhoto(from item: PhotosPickerItem) async -> ImportedTravelPhoto? {
+        guard let data = try? await item.loadTransferable(type: Data.self),
+              let image = UIImage(data: data) else {
+            return nil
+        }
+
+        return ImportedTravelPhoto(itemIdentifier: item.itemIdentifier, image: image)
     }
 }
 
-struct PhotoSlot: View {
+struct ImportedTravelPhoto: Identifiable {
+    let id: UUID
+    let itemIdentifier: String?
+    var image: UIImage
+
+    init(id: UUID = UUID(), itemIdentifier: String?, image: UIImage) {
+        self.id = id
+        self.itemIdentifier = itemIdentifier
+        self.image = image
+    }
+}
+
+struct ImportedPhotoSlot: View {
+    let photo: ImportedTravelPhoto
     let index: Int
-    let isFilled: Bool
+    let openAction: () -> Void
+    let deleteAction: () -> Void
+
+    var body: some View {
+        Button(action: openAction) {
+            ZStack(alignment: .topTrailing) {
+                Image(uiImage: photo.image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 72, height: 86)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                Text("\(index + 1)")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(5)
+                    .background(Color.black.opacity(0.34), in: Circle())
+                    .padding(5)
+            }
+            .overlay(alignment: .bottomLeading) {
+                Image(systemName: "pencil")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 24, height: 24)
+                    .background(Color.trouvenirInk.opacity(0.72), in: Circle())
+                    .padding(5)
+            }
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .topLeading) {
+            Button(role: .destructive, action: deleteAction) {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 24, height: 24)
+                    .background(Color.trouvenirCoral, in: Circle())
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white, lineWidth: 1.5)
+                    )
+            }
+            .buttonStyle(.plain)
+            .padding(5)
+            .accessibilityLabel("删除第 \(index + 1) 张照片")
+        }
+        .frame(width: 72, height: 86)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.black.opacity(0.06))
+        )
+        .accessibilityLabel("预览并编辑第 \(index + 1) 张照片")
+    }
+}
+
+struct EmptyPhotoSlot: View {
+    let index: Int
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8)
-                .fill(isFilled ? Color.trouvenirTeal.opacity(0.18) : Color(.secondarySystemBackground))
+                .fill(Color(.secondarySystemBackground))
 
-            Image(systemName: isFilled ? "checkmark.seal.fill" : "photo")
+            Image(systemName: "photo")
                 .font(.title2)
-                .foregroundStyle(isFilled ? Color.trouvenirTeal : Color.secondary)
+                .foregroundStyle(Color.secondary)
 
             Text("\(index + 1)")
                 .font(.caption2.weight(.bold))
@@ -1109,13 +1560,139 @@ struct PhotoSlot: View {
     }
 }
 
+struct LoadingPhotoSlot: View {
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.trouvenirTeal.opacity(0.12))
+
+            ProgressView()
+                .tint(Color.trouvenirTeal)
+        }
+        .frame(width: 72, height: 86)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.black.opacity(0.06))
+        )
+        .accessibilityLabel("正在导入照片")
+    }
+}
+
+struct PhotoPreviewEditorSheet: View {
+    @Binding var photo: ImportedTravelPhoto
+    let position: Int
+    let totalCount: Int
+    let replaceAction: (PhotosPickerItem) async -> Void
+    let deleteAction: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var replacementItem: PhotosPickerItem?
+    @State private var isReplacing = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                Image(uiImage: photo.image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+
+                HStack(spacing: 12) {
+                    Button {
+                        rotatePhoto(by: -90)
+                    } label: {
+                        Label("左转", systemImage: "rotate.left")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        rotatePhoto(by: 90)
+                    } label: {
+                        Label("右转", systemImage: "rotate.right")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                HStack(spacing: 12) {
+                    PhotosPicker(selection: $replacementItem, matching: .images) {
+                        Label("替换", systemImage: "photo.badge.plus")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isReplacing)
+
+                    Button(role: .destructive) {
+                        deleteAction()
+                        dismiss()
+                    } label: {
+                        Label("删除", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+            .padding(16)
+            .navigationTitle("照片 \(position)/\(totalCount)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .onChange(of: replacementItem) { _, item in
+            guard let item else { return }
+
+            Task {
+                isReplacing = true
+                await replaceAction(item)
+                isReplacing = false
+                replacementItem = nil
+            }
+        }
+    }
+
+    private func rotatePhoto(by degrees: CGFloat) {
+        guard let rotatedImage = photo.image.rotated(by: degrees) else { return }
+        photo.image = rotatedImage
+    }
+}
+
+extension UIImage {
+    func rotated(by degrees: CGFloat) -> UIImage? {
+        let radians = degrees * .pi / 180
+        let rotatedRect = CGRect(origin: .zero, size: size)
+            .applying(CGAffineTransform(rotationAngle: radians))
+            .integral
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale
+
+        return UIGraphicsImageRenderer(size: rotatedRect.size, format: format).image { context in
+            let cgContext = context.cgContext
+            cgContext.translateBy(x: rotatedRect.size.width / 2, y: rotatedRect.size.height / 2)
+            cgContext.rotate(by: radians)
+            draw(in: CGRect(
+                x: -size.width / 2,
+                y: -size.height / 2,
+                width: size.width,
+                height: size.height
+            ))
+        }
+    }
+}
+
 struct MemoryPromptStep: View {
     @Binding var prompt: String
-    @Binding var destination: String
-    @Binding var tripTitle: String
-    @Binding var companions: String
-    @Binding var feeling: String
+    @Binding var tripoSubjectCategory: String
+    @Binding var tripoSubjectDetail: String
+    @Binding var showSubjectTypes: Bool
     @Binding var selectedItems: [PhotosPickerItem]
+    @Binding var importedPhotos: [ImportedTravelPhoto]
     @Binding var showAdvanced: Bool
     let isGenerating: Bool
     let progress: Double
@@ -1130,31 +1707,25 @@ struct MemoryPromptStep: View {
                     .font(.title3.weight(.bold))
                     .foregroundStyle(Color.trouvenirInk)
 
-                Text("直接输入或语音转文字，系统会自动提取目的地、人物和情绪。")
+                Text("用一句话说清楚这次旅行，系统会自动提取目的地、人物和情绪。")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
 
-            ZStack(alignment: .bottomTrailing) {
-                PlaceholderTextEditor(
-                    text: $prompt,
-                    placeholder: ""
-                )
+            PlaceholderTextEditor(
+                text: $prompt,
+                placeholder: ""
+            )
 
-                VoiceInputButton(text: $prompt)
-                    .padding(12)
-            }
-
-            PhotoImportStrip(selectedItems: $selectedItems)
+            PhotoImportStrip(selectedItems: $selectedItems, importedPhotos: $importedPhotos)
 
             DisclosureGroup(isExpanded: $showAdvanced) {
-                VStack(alignment: .leading, spacing: 12) {
-                    LabeledTextField(title: "目的地", text: $destination, icon: "mappin.and.ellipse")
-                    LabeledTextField(title: "核心记忆", text: $tripTitle, icon: "heart.text.square")
-                    LabeledTextField(title: "同行的人", text: $companions, icon: "person.2")
-                    LabeledTextField(title: "当时的感受", text: $feeling, icon: "quote.bubble")
-                }
-                .padding(.top, 8)
+                SouvenirSubjectAdvancedControls(
+                    category: $tripoSubjectCategory,
+                    detail: $tripoSubjectDetail,
+                    showTypes: $showSubjectTypes
+                )
+                .padding(.top, 10)
             } label: {
                 Label("高级选项", systemImage: "slider.horizontal.3")
                     .font(.subheadline.weight(.semibold))
@@ -1178,8 +1749,11 @@ struct MemoryPromptStep: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Button(action: action) {
-                Label(isGenerating ? "正在生成旅行记忆" : "下一步", systemImage: "arrow.right")
+            Button {
+                UIApplication.shared.dismissKeyboard()
+                action()
+            } label: {
+                Label(isGenerating ? "正在创建旅行纪念品" : "创建旅行纪念品", systemImage: "sparkles")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -1204,6 +1778,8 @@ struct PlaceholderTextEditor: View {
             TextEditor(text: $text)
                 .frame(minHeight: 132)
                 .padding(10)
+                .textInputAutocapitalization(.sentences)
+                .autocorrectionDisabled()
                 .scrollContentBackground(.hidden)
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
 
@@ -1216,182 +1792,6 @@ struct PlaceholderTextEditor: View {
             }
         }
     }
-}
-
-struct VoiceInputButton: View {
-    @Binding var text: String
-    @StateObject private var speechInput = SpeechInputController()
-    @State private var baseText = ""
-
-    var body: some View {
-        Button {
-            if speechInput.isRecording {
-                speechInput.stopRecording()
-            } else {
-                baseText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                speechInput.startRecording()
-            }
-        } label: {
-            Label(speechInput.isRecording ? "停止" : "语音输入", systemImage: speechInput.isRecording ? "stop.fill" : "mic.fill")
-                .font(.caption.weight(.semibold))
-                .labelStyle(.titleAndIcon)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(
-                    speechInput.isRecording ? Color.trouvenirCoral.opacity(0.18) : Color.white.opacity(0.9),
-                    in: Capsule()
-                )
-                .foregroundStyle(speechInput.isRecording ? Color.trouvenirCoral : Color.trouvenirTeal)
-                .overlay(
-                    Capsule()
-                        .stroke((speechInput.isRecording ? Color.trouvenirCoral : Color.trouvenirTeal).opacity(0.22))
-                )
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(speechInput.isRecording ? "停止语音输入" : "开始语音输入")
-        .onChange(of: speechInput.transcript) { _, transcript in
-            let cleanedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanedTranscript.isEmpty else { return }
-
-            if baseText.isEmpty {
-                text = cleanedTranscript
-            } else {
-                text = "\(baseText)\n\(cleanedTranscript)"
-            }
-        }
-        .alert("语音输入不可用", isPresented: Binding(
-            get: { speechInput.errorMessage != nil },
-            set: { isPresented in
-                if !isPresented {
-                    speechInput.errorMessage = nil
-                }
-            }
-        )) {
-            Button("知道了", role: .cancel) {}
-        } message: {
-            Text(speechInput.errorMessage ?? "")
-        }
-    }
-}
-
-@MainActor
-final class SpeechInputController: NSObject, ObservableObject {
-    @Published var isRecording = false
-    @Published var transcript = ""
-    @Published var errorMessage: String?
-
-    private let audioEngine = AVAudioEngine()
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-
-    func startRecording() {
-        Task {
-            let permission = await Self.requestSpeechAndMicPermission()
-            guard permission.isAllowed else {
-                errorMessage = permission.message
-                return
-            }
-
-            do {
-                try beginRecording()
-            } catch {
-                stopRecording()
-                errorMessage = "无法启动语音输入，请检查麦克风权限或稍后重试。"
-            }
-        }
-    }
-
-    func stopRecording() {
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
-
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        recognitionRequest = nil
-        isRecording = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-    }
-
-    private func beginRecording() throws {
-        guard let speechRecognizer, speechRecognizer.isAvailable else {
-            errorMessage = "当前设备暂时无法使用中文语音识别。"
-            return
-        }
-
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        transcript = ""
-
-        let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
-        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        recognitionRequest = request
-
-        let inputNode = audioEngine.inputNode
-        inputNode.removeTap(onBus: 0)
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak request] buffer, _ in
-            request?.append(buffer)
-        }
-
-        audioEngine.prepare()
-        try audioEngine.start()
-        isRecording = true
-
-        recognitionTask = speechRecognizer.recognitionTask(with: request) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-
-                if let result {
-                    self.transcript = result.bestTranscription.formattedString
-                    if result.isFinal {
-                        self.stopRecording()
-                    }
-                }
-
-                if error != nil {
-                    self.stopRecording()
-                    self.errorMessage = "语音识别中断了，请再试一次。"
-                }
-            }
-        }
-    }
-
-    nonisolated private static func requestSpeechAndMicPermission() async -> SpeechPermissionResult {
-        let speechStatus = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
-            }
-        }
-
-        guard speechStatus == .authorized else {
-            return SpeechPermissionResult(isAllowed: false, message: "请在系统设置中允许 Trouvenir 使用语音识别。")
-        }
-
-        let micAllowed = await withCheckedContinuation { continuation in
-            AVAudioApplication.requestRecordPermission { allowed in
-                continuation.resume(returning: allowed)
-            }
-        }
-
-        guard micAllowed else {
-            return SpeechPermissionResult(isAllowed: false, message: "请在系统设置中允许 Trouvenir 使用麦克风。")
-        }
-
-        return SpeechPermissionResult(isAllowed: true, message: "")
-    }
-}
-
-struct SpeechPermissionResult {
-    let isAllowed: Bool
-    let message: String
 }
 
 struct CompactMemorySummary: View {
@@ -1422,6 +1822,67 @@ struct CompactMemorySummary: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.black.opacity(0.06))
         )
+    }
+}
+
+struct SouvenirSubjectAdvancedControls: View {
+    @Binding var category: String
+    @Binding var detail: String
+    @Binding var showTypes: Bool
+
+    private let question = askUserQuestion()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("3D 纪念品主体")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Color.trouvenirInk)
+
+                Text(question.constraint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            DisclosureGroup(isExpanded: $showTypes) {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                    ForEach(question.suggestions, id: \.self) { suggestion in
+                        Button {
+                            category = suggestion
+                        } label: {
+                            Text(suggestion)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(category == suggestion ? Color.trouvenirTeal : Color.secondary)
+                    }
+                }
+                .padding(.top, 8)
+            } label: {
+                HStack {
+                    Label("主体类型", systemImage: "cube.transparent")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text(category)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Color.trouvenirInk)
+                }
+            }
+
+            TextField(question.detailPlaceholder(for: category), text: $detail)
+                .textInputAutocapitalization(.never)
+                .submitLabel(.done)
+                .onSubmit {
+                    UIApplication.shared.dismissKeyboard()
+                }
+                .padding(13)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+        }
     }
 }
 
@@ -1465,6 +1926,10 @@ struct SouvenirSubjectQuestionPanel: View {
 
             TextField(question.detailPlaceholder(for: category), text: $detail)
                 .textInputAutocapitalization(.never)
+                .submitLabel(.done)
+                .onSubmit {
+                    UIApplication.shared.dismissKeyboard()
+                }
                 .padding(13)
                 .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
 
@@ -1716,7 +2181,7 @@ struct TripoModelPanel: View {
 
     private var actionTitle: String {
         if let task, !task.isFinal {
-            return isGenerating ? "正在检查 3D 任务" : "继续检查 3D 任务"
+            return isGenerating ? "正在检查生成进度" : "继续检查生成进度"
         }
 
         if isGenerating {
@@ -1744,7 +2209,11 @@ struct TripoModelPanel: View {
                 return "模型已返回，可以打开或保存"
             }
 
-            return "任务 \(task.taskID)"
+            if task.isFinal {
+                return "生成没有完成，可以调整主体后重试"
+            }
+
+            return "正在制作你的 3D 纪念品"
         }
 
         if errorMessage != nil {
@@ -1895,7 +2364,7 @@ final class AppDiagnostics: @unchecked Sendable {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
-        URLSession.shared.dataTask(with: request).resume()
+        TrouvenirURLSessions.bridge.dataTask(with: request).resume()
     }
 
     private func rotateIfNeeded() {
@@ -2138,7 +2607,7 @@ final class ModelRenderDiagnostics: @unchecked Sendable {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
-        URLSession.shared.dataTask(with: request).resume()
+        TrouvenirURLSessions.bridge.dataTask(with: request).resume()
     }
 
     private func rotateIfNeeded() {
@@ -2993,8 +3462,12 @@ enum CollectionShelfTab: String, CaseIterable, Identifiable {
 }
 
 struct CollectionView: View {
-    let memories: [MemoryProject]
-    @State private var selectedTab: CollectionShelfTab = .stories
+    @Binding var memories: [MemoryProject]
+    let activeTripoMemoryIDs: Set<UUID>
+    let tripoErrorsByMemoryID: [UUID: String]
+    let generateSouvenir: (UUID) -> Void
+    @State private var selectedTab: CollectionShelfTab = .souvenirs
+    @State private var searchText = ""
     @State private var modelViewerURL: URL?
     private let tripoClient = TripoAPIClient()
 
@@ -3007,19 +3480,28 @@ struct CollectionView: View {
                     if memories.isEmpty {
                         EmptyCollectionState()
                     } else {
+                        CollectionSearchField(text: $searchText, selectedTab: selectedTab)
+
                         switch selectedTab {
                         case .stories:
-                            StoryCollectionSection(memories: memories)
+                            StoryCollectionSection(memories: memories, searchText: searchText)
                         case .souvenirs:
-                            SouvenirCollectionSection(memories: memories) { modelURL in
-                                let proxiedURL = tripoClient.proxiedModelURL(for: modelURL)
-                                ModelRenderDiagnostics.shared.recordModelOpen(
-                                    source: "collection",
-                                    modelURL: modelURL,
-                                    proxiedURL: proxiedURL
-                                )
-                                modelViewerURL = proxiedURL
-                            }
+                            SouvenirCollectionSection(
+                                memories: memories,
+                                searchText: searchText,
+                                activeTripoMemoryIDs: activeTripoMemoryIDs,
+                                tripoErrorsByMemoryID: tripoErrorsByMemoryID,
+                                generateSouvenir: generateSouvenir,
+                                openModel: { modelURL in
+                                    let proxiedURL = tripoClient.proxiedModelURL(for: modelURL)
+                                    ModelRenderDiagnostics.shared.recordModelOpen(
+                                        source: "collection",
+                                        modelURL: modelURL,
+                                        proxiedURL: proxiedURL
+                                    )
+                                    modelViewerURL = proxiedURL
+                                }
+                            )
                         }
                     }
                 }
@@ -3053,6 +3535,48 @@ struct CollectionView: View {
                 data: ["tab": tab.rawValue]
             )
         }
+    }
+}
+
+struct CollectionSearchField: View {
+    @Binding var text: String
+    let selectedTab: CollectionShelfTab
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.trouvenirTeal)
+
+            TextField(placeholder, text: $text)
+                .font(.subheadline)
+                .foregroundStyle(Color.trouvenirInk)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("清除搜索关键词")
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.black.opacity(0.06))
+        )
+    }
+
+    private var placeholder: String {
+        "搜索\(selectedTab.rawValue)"
     }
 }
 
@@ -3093,16 +3617,29 @@ struct CollectionShelfTabs: View {
 
 struct StoryCollectionSection: View {
     let memories: [MemoryProject]
+    let searchText: String
 
-    private var storyMemories: [MemoryProject] {
+    private var baseStoryMemories: [MemoryProject] {
         Array(memories.reversed()).deduplicatedMemories()
     }
 
+    private var storyMemories: [MemoryProject] {
+        guard !searchKeywords.isEmpty else {
+            return baseStoryMemories
+        }
+
+        return baseStoryMemories.filter { memory in
+            collectionSearchMatches(fields: storySearchFields(for: memory), keywords: searchKeywords)
+        }
+    }
+
     var body: some View {
-        if storyMemories.isEmpty {
+        if baseStoryMemories.isEmpty {
             EmptyTypedCollectionState(tab: .stories)
+        } else if storyMemories.isEmpty {
+            EmptyCollectionSearchState(tab: .stories, query: normalizedSearchText)
         } else {
-            VStack(alignment: .leading, spacing: 12) {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible())], spacing: 12) {
                 ForEach(storyMemories) { memory in
                     NavigationLink {
                         StoryDetailView(memory: memory)
@@ -3114,43 +3651,87 @@ struct StoryCollectionSection: View {
             }
         }
     }
+
+    private var normalizedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var searchKeywords: [String] {
+        collectionSearchKeywords(from: normalizedSearchText)
+    }
+
+    private func storySearchFields(for memory: MemoryProject) -> [String] {
+        [
+            memory.title,
+            memory.storyTitle,
+            memory.destination,
+            memory.identityTitle,
+            memory.companions,
+            memory.duration,
+            memory.story
+        ] + memory.souvenirs.flatMap { [$0.name, $0.caption] }
+    }
 }
 
 struct StoryCollectionCard: View {
     let memory: MemoryProject
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(memory.storyTitle)
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(Color.trouvenirInk)
-                        .lineLimit(2)
-                    Text(memory.destination)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+        VStack(alignment: .leading, spacing: 9) {
+            StoryPreviewTile(memory: memory)
+                .frame(height: 118)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                Spacer()
+            VStack(alignment: .leading, spacing: 4) {
+                Text(memory.storyTitle)
+                    .font(.footnote.weight(.bold))
+                    .foregroundStyle(Color.trouvenirInk)
+                    .lineLimit(2)
 
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(.tertiary)
+                Text(memory.destination)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-
-            Text(memory.story)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineSpacing(4)
-                .lineLimit(3)
         }
-        .padding(14)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.black.opacity(0.06))
         )
+    }
+}
+
+struct StoryPreviewTile: View {
+    let memory: MemoryProject
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.trouvenirTeal.opacity(0.10))
+
+            VStack(alignment: .leading, spacing: 8) {
+                Image(systemName: "text.book.closed")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.trouvenirTeal)
+
+                Text(memory.story)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.trouvenirInk.opacity(0.76))
+                    .lineSpacing(3)
+                    .lineLimit(4)
+
+                Spacer(minLength: 0)
+
+                Label(memory.duration, systemImage: "calendar")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.trouvenirTeal)
+                    .lineLimit(1)
+            }
+            .padding(12)
+        }
     }
 }
 
@@ -3201,37 +3782,137 @@ struct StoryDetailView: View {
 
 struct SouvenirCollectionSection: View {
     let memories: [MemoryProject]
+    let searchText: String
+    let activeTripoMemoryIDs: Set<UUID>
+    let tripoErrorsByMemoryID: [UUID: String]
+    let generateSouvenir: (UUID) -> Void
     let openModel: (URL) -> Void
 
-    private var souvenirMemories: [MemoryProject] {
+    private var baseSouvenirMemories: [MemoryProject] {
         Array(memories.reversed())
-            .filter { $0.tripoTask?.hasVisualAsset == true }
             .deduplicatedModels()
     }
 
+    private var souvenirMemories: [MemoryProject] {
+        guard !searchKeywords.isEmpty else {
+            return baseSouvenirMemories
+        }
+
+        return baseSouvenirMemories.filter { memory in
+            collectionSearchMatches(fields: souvenirSearchFields(for: memory), keywords: searchKeywords)
+        }
+    }
+
     var body: some View {
-        if souvenirMemories.isEmpty {
+        if baseSouvenirMemories.isEmpty {
             EmptyTypedCollectionState(tab: .souvenirs)
+        } else if souvenirMemories.isEmpty {
+            EmptyCollectionSearchState(tab: .souvenirs, query: normalizedSearchText)
         } else {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible())], spacing: 12) {
                 ForEach(souvenirMemories) { memory in
-                    if let task = memory.tripoTask {
-                        NavigationLink {
-                            SouvenirDetailView(memory: memory, task: task, openModel: openModel)
-                        } label: {
-                            SouvenirWarehouseCard(memory: memory, task: task)
-                        }
-                        .buttonStyle(.plain)
+                    NavigationLink {
+                        SouvenirDetailView(
+                            memory: memory,
+                            task: memory.tripoTask,
+                            isGenerating: activeTripoMemoryIDs.contains(memory.id),
+                            errorMessage: tripoErrorsByMemoryID[memory.id],
+                            generateSouvenir: {
+                                generateSouvenir(memory.id)
+                            },
+                            openModel: openModel
+                        )
+                    } label: {
+                        SouvenirWarehouseCard(
+                            memory: memory,
+                            task: memory.tripoTask,
+                            isGenerating: activeTripoMemoryIDs.contains(memory.id),
+                            errorMessage: tripoErrorsByMemoryID[memory.id]
+                        )
                     }
+                    .buttonStyle(.plain)
                 }
             }
+        }
+    }
+
+    private var normalizedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var searchKeywords: [String] {
+        collectionSearchKeywords(from: normalizedSearchText)
+    }
+
+    private func souvenirSearchFields(for memory: MemoryProject) -> [String] {
+        let task = memory.tripoTask
+        return [
+            memory.title,
+            memory.storyTitle,
+            memory.destination,
+            memory.identityTitle,
+            memory.story,
+            task?.localizedStatus ?? "",
+            tripoErrorsByMemoryID[memory.id] ?? "",
+            task?.modelURL?.absoluteString ?? "",
+            task?.renderedImageURL?.absoluteString ?? ""
+        ] + memory.souvenirs.flatMap { [$0.name, $0.caption] }
+    }
+}
+
+struct EmptyCollectionSearchState: View {
+    let tab: CollectionShelfTab
+    let query: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .font(.title2)
+                .foregroundStyle(Color.trouvenirTeal)
+                .frame(width: 48, height: 48)
+                .background(Color.trouvenirTeal.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+
+            Text("没有找到相关\(tab.rawValue)")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(Color.trouvenirInk)
+
+            Text("换个关键词试试，例如地点、故事标题或纪念品名称。")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.black.opacity(0.06))
+        )
+        .accessibilityLabel("没有找到\(query)相关的\(tab.rawValue)")
+    }
+}
+
+private func collectionSearchKeywords(from searchText: String) -> [String] {
+    searchText
+        .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+        .map(String.init)
+        .filter { !$0.isEmpty }
+}
+
+private func collectionSearchMatches(fields: [String], keywords: [String]) -> Bool {
+    guard !keywords.isEmpty else { return true }
+    return keywords.allSatisfy { keyword in
+        fields.contains { field in
+            field.localizedCaseInsensitiveContains(keyword)
         }
     }
 }
 
 struct SouvenirWarehouseCard: View {
     let memory: MemoryProject
-    let task: TripoTask
+    let task: TripoTask?
+    let isGenerating: Bool
+    let errorMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -3249,6 +3930,17 @@ struct SouvenirWarehouseCard: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
+                Label(statusText, systemImage: statusIcon)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .lineLimit(1)
+
+                SouvenirGenerationProgressBar(
+                    task: task,
+                    isGenerating: isGenerating,
+                    compact: true
+                )
             }
         }
         .padding(10)
@@ -3259,11 +3951,44 @@ struct SouvenirWarehouseCard: View {
                 .stroke(Color.black.opacity(0.06))
         )
     }
+
+    private var statusText: String {
+        if isGenerating {
+            return task?.localizedStatus ?? "正在准备生成"
+        }
+        if errorMessage != nil {
+            return "等待继续生成"
+        }
+        return task?.localizedStatus ?? "等待生成"
+    }
+
+    private var statusIcon: String {
+        if isGenerating {
+            return "wand.and.stars"
+        }
+        if errorMessage != nil {
+            return "exclamationmark.triangle.fill"
+        }
+        return task?.statusIcon ?? "cube.transparent"
+    }
+
+    private var statusColor: Color {
+        if task?.status == "success" {
+            return Color.trouvenirTeal
+        }
+        if errorMessage != nil {
+            return Color.trouvenirCoral
+        }
+        return .secondary
+    }
 }
 
 struct SouvenirDetailView: View {
     let memory: MemoryProject
-    let task: TripoTask
+    let task: TripoTask?
+    let isGenerating: Bool
+    let errorMessage: String?
+    let generateSouvenir: () -> Void
     let openModel: (URL) -> Void
     @State private var showIdeas = false
 
@@ -3284,13 +4009,19 @@ struct SouvenirDetailView: View {
                         .foregroundStyle(Color.trouvenirInk)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Label(task.localizedStatus, systemImage: task.statusIcon)
+                    Label(statusText, systemImage: statusIcon)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(task.status == "success" ? Color.trouvenirTeal : Color.secondary)
+                        .foregroundStyle(statusColor)
                 }
 
+                SouvenirGenerationProgressBar(
+                    task: task,
+                    isGenerating: isGenerating,
+                    compact: false
+                )
+
                 HStack(spacing: 12) {
-                    if let modelURL = task.modelURL {
+                    if let modelURL = task?.modelURL {
                         Button {
                             openModel(modelURL)
                         } label: {
@@ -3302,7 +4033,7 @@ struct SouvenirDetailView: View {
                         .tint(Color.trouvenirInk)
                     }
 
-                    if let renderedImageURL = task.renderedImageURL {
+                    if let renderedImageURL = task?.renderedImageURL {
                         Link(destination: renderedImageURL) {
                             Label("查看图片", systemImage: "photo")
                                 .font(.subheadline.weight(.semibold))
@@ -3310,6 +4041,26 @@ struct SouvenirDetailView: View {
                         }
                         .buttonStyle(.bordered)
                         .tint(Color.trouvenirTeal)
+                    }
+                }
+
+                if task?.status != "success" {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let errorMessage {
+                            Label(errorMessage, systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(Color.trouvenirCoral)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        Button(action: generateSouvenir) {
+                            Label(actionTitle, systemImage: isGenerating ? "wand.and.stars" : "cube.transparent")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.trouvenirInk)
+                        .disabled(isGenerating)
                     }
                 }
 
@@ -3344,17 +4095,116 @@ struct SouvenirDetailView: View {
         .navigationTitle("纪念品")
         .navigationBarTitleDisplayMode(.inline)
     }
+
+    private var statusText: String {
+        if isGenerating {
+            return task?.localizedStatus ?? "正在准备生成"
+        }
+        if errorMessage != nil {
+            return "等待继续生成"
+        }
+        return task?.localizedStatus ?? "等待生成"
+    }
+
+    private var statusIcon: String {
+        if isGenerating {
+            return "wand.and.stars"
+        }
+        if errorMessage != nil {
+            return "exclamationmark.triangle.fill"
+        }
+        return task?.statusIcon ?? "cube.transparent"
+    }
+
+    private var statusColor: Color {
+        if task?.status == "success" {
+            return Color.trouvenirTeal
+        }
+        if errorMessage != nil {
+            return Color.trouvenirCoral
+        }
+        return .secondary
+    }
+
+    private var actionTitle: String {
+        if isGenerating {
+            return "正在制作 3D 纪念品"
+        }
+        if task != nil {
+            return "继续检查生成进度"
+        }
+        return "生成 3D 纪念品"
+    }
+}
+
+struct SouvenirGenerationProgressBar: View {
+    let task: TripoTask?
+    let isGenerating: Bool
+    let compact: Bool
+
+    var body: some View {
+        if shouldShowProgress {
+            VStack(alignment: .leading, spacing: compact ? 4 : 8) {
+                HStack(spacing: 8) {
+                    if !compact {
+                        Text("生成进度")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.trouvenirInk.opacity(0.76))
+                    }
+
+                    Spacer(minLength: 0)
+
+                    Text(progressText)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                ProgressView(value: progressValue)
+                    .tint(Color.trouvenirTeal)
+                    .accessibilityLabel("3D 纪念品生成进度")
+                    .accessibilityValue(progressText)
+            }
+            .padding(.top, compact ? 2 : 0)
+        }
+    }
+
+    private var shouldShowProgress: Bool {
+        if isGenerating {
+            return true
+        }
+
+        guard let task else {
+            return false
+        }
+
+        return !task.isFinal
+    }
+
+    private var progressValue: Double {
+        if task?.status == "success" {
+            return 1
+        }
+
+        let rawValue = Double(task?.progress ?? 0) / 100
+        let visibleStart = (isGenerating || task != nil) ? 0.08 : 0
+        return min(max(rawValue, visibleStart), 0.99)
+    }
+
+    private var progressText: String {
+        "\(Int((progressValue * 100).rounded()))%"
+    }
 }
 
 struct SouvenirPreviewImage: View {
-    let task: TripoTask
+    let task: TripoTask?
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.trouvenirTeal.opacity(0.10))
 
-            if let renderedImageURL = task.renderedImageURL {
+            if let renderedImageURL = task?.renderedImageURL {
                 AsyncImage(url: renderedImageURL) { phase in
                     switch phase {
                     case .success(let image):
@@ -3451,12 +4301,30 @@ struct EmptyCollectionState: View {
 @MainActor
 final class TravelArchiveCountryResolver: ObservableObject {
     @Published private var resolvedCountryNames: [String: String] = [:]
+    @Published private var resolvedLocations: [String: ResolvedTravelLocation] = [:]
 
     private var failedKeys: Set<String> = []
+    private var failedLocationKeys: Set<String> = []
+    private var resolvingLocationKeys: Set<String> = []
     private let geocoder = CLGeocoder()
+    private let locationAIClient = LocationAIClient()
+
+    func cityName(for destination: String) -> String {
+        if let resolvedLocation = cachedLocation(for: destination),
+           !resolvedLocation.cityName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return resolvedLocation.cityName
+        }
+
+        return TravelArchive.cityName(for: destination)
+    }
 
     func countryName(for destination: String) -> String {
-        let cityName = TravelArchive.cityName(for: destination)
+        if let resolvedLocation = cachedLocation(for: destination),
+           resolvedLocation.hasCountry {
+            return resolvedLocation.countryName
+        }
+
+        let cityName = cityName(for: destination)
         let key = TravelArchive.normalizedLocationKey(for: cityName)
 
         if let resolvedName = resolvedCountryNames[key] {
@@ -3467,10 +4335,117 @@ final class TravelArchiveCountryResolver: ObservableObject {
     }
 
     func resolveCountries(for destinations: [String]) async {
-        let cityNames = Set(destinations.map { TravelArchive.cityName(for: $0) }).sorted()
+        for destination in Set(destinations).sorted() {
+            await resolveLocation(for: destination)
+        }
+
+        let cityNames = Set(destinations.map { cityName(for: $0) }).sorted()
 
         for cityName in cityNames {
             await resolveCountry(for: cityName)
+        }
+    }
+
+    private func resolveLocation(for destination: String) async {
+        let value = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = TravelArchive.normalizedLocationKey(for: value)
+        guard !key.isEmpty,
+              resolvedLocations[key] == nil,
+              !failedLocationKeys.contains(key),
+              !resolvingLocationKeys.contains(key) else {
+            return
+        }
+
+        let localResolution = TravelArchive.resolveLocation(for: value)
+        if let countryName = localResolution.countryName {
+            cacheLocation(
+                ResolvedTravelLocation(
+                    cityName: localResolution.cityName,
+                    countryName: countryName,
+                    regionCode: localResolution.regionCode ?? "",
+                    confidence: "high",
+                    reason: localResolution.rule
+                ),
+                for: value,
+                source: "known"
+            )
+            AppDiagnostics.shared.record(
+                "location.ai.resolve.known",
+                data: [
+                    "input": value,
+                    "city": localResolution.cityName,
+                    "country": countryName,
+                    "regionCode": localResolution.regionCode ?? "",
+                    "rule": localResolution.rule
+                ],
+                dedupeKey: "location.ai.known:\(key):\(localResolution.rule)"
+            )
+            return
+        }
+
+        resolvingLocationKeys.insert(key)
+        defer { resolvingLocationKeys.remove(key) }
+
+        do {
+            AppDiagnostics.shared.record(
+                "location.ai.resolve.start",
+                data: [
+                    "input": value,
+                    "normalizedKey": key,
+                    "provider": "DeepSeek"
+                ],
+                dedupeKey: "location.ai.start:\(key)"
+            )
+            let resolvedLocation = try await locationAIClient.resolveLocation(
+                TravelLocationAIRequest(input: value, context: "")
+            )
+
+            guard resolvedLocation.hasCountry,
+                  resolvedLocation.confidence != "low" else {
+                failedLocationKeys.insert(key)
+                AppDiagnostics.shared.record(
+                    "location.ai.resolve.unusable",
+                    level: "warning",
+                    data: [
+                        "input": value,
+                        "normalizedKey": key,
+                        "city": resolvedLocation.cityName,
+                        "country": resolvedLocation.countryName,
+                        "regionCode": resolvedLocation.regionCode,
+                        "confidence": resolvedLocation.confidence,
+                        "reason": resolvedLocation.reason
+                    ],
+                    dedupeKey: "location.ai.unusable:\(key):\(resolvedLocation.confidence)"
+                )
+                return
+            }
+
+            cacheLocation(resolvedLocation, for: value, source: "deepseek")
+            AppDiagnostics.shared.record(
+                "location.ai.resolve.success",
+                data: [
+                    "input": value,
+                    "normalizedKey": key,
+                    "city": resolvedLocation.cityName,
+                    "country": resolvedLocation.countryName,
+                    "regionCode": resolvedLocation.regionCode,
+                    "confidence": resolvedLocation.confidence,
+                    "reason": resolvedLocation.reason
+                ],
+                dedupeKey: "location.ai.success:\(key):\(resolvedLocation.cityName):\(resolvedLocation.countryName)"
+            )
+        } catch {
+            failedLocationKeys.insert(key)
+            AppDiagnostics.shared.record(
+                "location.ai.resolve.error",
+                level: "warning",
+                data: [
+                    "input": value,
+                    "normalizedKey": key,
+                    "message": error.localizedDescription
+                ],
+                dedupeKey: "location.ai.error:\(key):\(error.localizedDescription)"
+            )
         }
     }
 
@@ -3492,6 +4467,23 @@ final class TravelArchiveCountryResolver: ObservableObject {
             return
         }
 
+        if let resolvedLocation = cachedLocation(for: cityName),
+           resolvedLocation.hasCountry {
+            resolvedCountryNames[key] = resolvedLocation.countryName
+            AppDiagnostics.shared.record(
+                "location.country.resolve.ai.cached",
+                data: [
+                    "city": cityName,
+                    "normalizedKey": key,
+                    "country": resolvedLocation.countryName,
+                    "regionCode": resolvedLocation.regionCode,
+                    "confidence": resolvedLocation.confidence
+                ],
+                dedupeKey: "country.ai.cached:\(key):\(resolvedLocation.countryName)"
+            )
+            return
+        }
+
         if let knownCountryName = TravelArchive.knownCountryName(for: cityName) {
             resolvedCountryNames[key] = knownCountryName
             AppDiagnostics.shared.record(
@@ -3502,6 +4494,24 @@ final class TravelArchiveCountryResolver: ObservableObject {
                     "country": knownCountryName
                 ],
                 dedupeKey: "country.known:\(key):\(knownCountryName)"
+            )
+            return
+        }
+
+        await resolveLocation(for: cityName)
+        if let resolvedLocation = cachedLocation(for: cityName),
+           resolvedLocation.hasCountry {
+            resolvedCountryNames[key] = resolvedLocation.countryName
+            AppDiagnostics.shared.record(
+                "location.country.resolve.ai.success",
+                data: [
+                    "city": cityName,
+                    "normalizedKey": key,
+                    "country": resolvedLocation.countryName,
+                    "regionCode": resolvedLocation.regionCode,
+                    "confidence": resolvedLocation.confidence
+                ],
+                dedupeKey: "country.ai.success:\(key):\(resolvedLocation.countryName)"
             )
             return
         }
@@ -3612,6 +4622,44 @@ final class TravelArchiveCountryResolver: ObservableObject {
             )
         }
     }
+
+    private func cachedLocation(for destination: String) -> ResolvedTravelLocation? {
+        let key = TravelArchive.normalizedLocationKey(for: destination)
+        if let resolvedLocation = resolvedLocations[key] {
+            return resolvedLocation
+        }
+
+        let cityName = TravelArchive.resolveLocation(for: destination).cityName
+        let cityKey = TravelArchive.normalizedLocationKey(for: cityName)
+        return resolvedLocations[cityKey]
+    }
+
+    private func cacheLocation(_ location: ResolvedTravelLocation, for destination: String, source: String) {
+        let key = TravelArchive.normalizedLocationKey(for: destination)
+        let cityKey = TravelArchive.normalizedLocationKey(for: location.cityName)
+        if !key.isEmpty {
+            resolvedLocations[key] = location
+        }
+        if !cityKey.isEmpty {
+            resolvedLocations[cityKey] = location
+            if location.hasCountry {
+                resolvedCountryNames[cityKey] = location.countryName
+            }
+        }
+
+        AppDiagnostics.shared.record(
+            "location.cache.updated",
+            data: [
+                "input": destination,
+                "city": location.cityName,
+                "country": location.countryName,
+                "regionCode": location.regionCode,
+                "confidence": location.confidence,
+                "source": source
+            ],
+            dedupeKey: "location.cache:\(key):\(cityKey):\(location.countryName):\(source)"
+        )
+    }
 }
 
 struct IdentityView: View {
@@ -3628,7 +4676,7 @@ struct IdentityView: View {
     }
 
     private var cityCount: Int {
-        Set(memories.map { TravelArchive.cityName(for: $0.destination) }).count
+        Set(memories.map { countryResolver.cityName(for: $0.destination) }).count
     }
 
     private var souvenirCount: Int {
@@ -3643,7 +4691,7 @@ struct IdentityView: View {
 
     private var archiveResolutionKey: String {
         memories
-            .map { TravelArchive.cityName(for: $0.destination) }
+            .map { $0.destination }
             .sorted()
             .joined(separator: "|")
     }
@@ -3707,7 +4755,7 @@ struct IdentityView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    SectionHeader(title: "旅行者档案", subtitle: "让积累感成为产品的长期价值")
+                    SectionHeader(title: "旅行者档案", subtitle: "让积累感成为旅行的长期价值")
 
                     VStack(alignment: .leading, spacing: 18) {
                         HStack(spacing: 14) {
@@ -3888,7 +4936,7 @@ struct TravelerAvatarPicker: View {
     }
 
     @ViewBuilder
-    private var avatarContent: some View {
+    nonisolated private var avatarContent: some View {
         if let avatarImageData,
            let avatarImage = UIImage(data: avatarImageData) {
             Image(uiImage: avatarImage)
@@ -3949,7 +4997,7 @@ struct IdentityArchiveListView: View {
 
     private var cityGroups: [(name: String, memories: [MemoryProject])] {
         Dictionary(grouping: memories) { memory in
-            TravelArchive.cityName(for: memory.destination)
+            countryResolver.cityName(for: memory.destination)
         }
         .map { (name: $0.key, memories: $0.value) }
         .sorted { $0.name < $1.name }
@@ -3957,7 +5005,7 @@ struct IdentityArchiveListView: View {
 
     private var archiveResolutionKey: String {
         memories
-            .map { TravelArchive.cityName(for: $0.destination) }
+            .map { $0.destination }
             .sorted()
             .joined(separator: "|")
     }
@@ -3973,7 +5021,7 @@ struct IdentityArchiveListView: View {
                         ForEach(countryGroups, id: \.name) { group in
                             ArchiveSummaryCard(
                                 title: group.name,
-                                subtitle: "\(Set(group.memories.map { TravelArchive.cityName(for: $0.destination) }).count) 个城市",
+                                subtitle: "\(Set(group.memories.map { countryResolver.cityName(for: $0.destination) }).count) 个城市",
                                 detail: "\(group.memories.count) 段记忆 · \(TravelArchive.collectibleCount(in: group.memories)) 件收藏",
                                 icon: "globe.asia.australia"
                             )
@@ -4148,6 +5196,9 @@ struct MemoryProject: Identifiable {
     let story: String
     let souvenirs: [GeneratedSouvenir]
     let accent: Color
+    let accentKey: String
+    let tripoSubjectCategory: String
+    let tripoSubjectDetail: String
     let tripoTask: TripoTask?
 
     init(
@@ -4163,6 +5214,9 @@ struct MemoryProject: Identifiable {
         story: String,
         souvenirs: [GeneratedSouvenir],
         accent: Color,
+        accentKey: String = "teal",
+        tripoSubjectCategory: String = "人物",
+        tripoSubjectDetail: String = "",
         tripoTask: TripoTask? = nil
     ) {
         self.id = id
@@ -4177,6 +5231,9 @@ struct MemoryProject: Identifiable {
         self.story = story
         self.souvenirs = souvenirs
         self.accent = accent
+        self.accentKey = TravelMemoryColorKey.normalized(accentKey)
+        self.tripoSubjectCategory = MemoryProject.normalizedSubjectCategory(tripoSubjectCategory)
+        self.tripoSubjectDetail = tripoSubjectDetail.trimmingCharacters(in: .whitespacesAndNewlines)
         self.tripoTask = tripoTask
     }
 
@@ -4208,8 +5265,37 @@ struct MemoryProject: Identifiable {
             story: story,
             souvenirs: souvenirs,
             accent: accent,
+            accentKey: accentKey,
+            tripoSubjectCategory: tripoSubjectCategory,
+            tripoSubjectDetail: tripoSubjectDetail,
             tripoTask: tripoTask
         )
+    }
+
+    func updated(tripoSubjectCategory: String, tripoSubjectDetail: String) -> MemoryProject {
+        MemoryProject(
+            id: id,
+            title: title,
+            destination: destination,
+            identityTitle: identityTitle,
+            companions: companions,
+            photoCount: photoCount,
+            walkingDistance: walkingDistance,
+            duration: duration,
+            storyTitle: storyTitle,
+            story: story,
+            souvenirs: souvenirs,
+            accent: accent,
+            accentKey: accentKey,
+            tripoSubjectCategory: tripoSubjectCategory,
+            tripoSubjectDetail: tripoSubjectDetail,
+            tripoTask: tripoTask
+        )
+    }
+
+    private static func normalizedSubjectCategory(_ category: String) -> String {
+        let trimmed = category.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "人物" : trimmed
     }
 
     func isSimilarCollectionItem(to other: MemoryProject) -> Bool {
@@ -4230,6 +5316,169 @@ struct MemoryProject: Identifiable {
         }
 
         return TextSimilarity.isSimilar(modelSimilarityText, other.modelSimilarityText)
+    }
+}
+
+private struct StoredMemoryProject: Codable {
+    let id: UUID
+    let title: String
+    let destination: String
+    let identityTitle: String
+    let companions: String
+    let photoCount: Int
+    let walkingDistance: String
+    let duration: String
+    let storyTitle: String
+    let story: String
+    let souvenirs: [StoredGeneratedSouvenir]
+    let accentKey: String
+    let tripoSubjectCategory: String
+    let tripoSubjectDetail: String
+    let tripoTask: TripoTask?
+
+    init(memory: MemoryProject) {
+        id = memory.id
+        title = memory.title
+        destination = memory.destination
+        identityTitle = memory.identityTitle
+        companions = memory.companions
+        photoCount = memory.photoCount
+        walkingDistance = memory.walkingDistance
+        duration = memory.duration
+        storyTitle = memory.storyTitle
+        story = memory.story
+        souvenirs = memory.souvenirs.map(StoredGeneratedSouvenir.init)
+        accentKey = TravelMemoryColorKey.normalized(memory.accentKey)
+        tripoSubjectCategory = memory.tripoSubjectCategory
+        tripoSubjectDetail = memory.tripoSubjectDetail
+        tripoTask = memory.tripoTask
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? "未命名旅行"
+        destination = try container.decodeIfPresent(String.self, forKey: .destination) ?? "未知目的地"
+        identityTitle = try container.decodeIfPresent(String.self, forKey: .identityTitle) ?? "\(destination)收藏家"
+        companions = try container.decodeIfPresent(String.self, forKey: .companions) ?? "旅行者"
+        photoCount = try container.decodeIfPresent(Int.self, forKey: .photoCount) ?? 0
+        walkingDistance = try container.decodeIfPresent(String.self, forKey: .walkingDistance) ?? "待补充"
+        duration = try container.decodeIfPresent(String.self, forKey: .duration) ?? "待补充"
+        storyTitle = try container.decodeIfPresent(String.self, forKey: .storyTitle) ?? "《旅行记忆》"
+        story = try container.decodeIfPresent(String.self, forKey: .story) ?? ""
+        souvenirs = try container.decodeIfPresent([StoredGeneratedSouvenir].self, forKey: .souvenirs) ?? []
+        accentKey = TravelMemoryColorKey.normalized(
+            try container.decodeIfPresent(String.self, forKey: .accentKey) ?? "teal"
+        )
+        tripoSubjectCategory = try container.decodeIfPresent(String.self, forKey: .tripoSubjectCategory) ?? "人物"
+        tripoSubjectDetail = try container.decodeIfPresent(String.self, forKey: .tripoSubjectDetail) ?? ""
+        tripoTask = try container.decodeIfPresent(TripoTask.self, forKey: .tripoTask)
+    }
+
+    var memoryProject: MemoryProject {
+        MemoryProject(
+            id: id,
+            title: title,
+            destination: destination,
+            identityTitle: identityTitle,
+            companions: companions,
+            photoCount: photoCount,
+            walkingDistance: walkingDistance,
+            duration: duration,
+            storyTitle: storyTitle,
+            story: story,
+            souvenirs: souvenirs.map(\.generatedSouvenir),
+            accent: Color.travelMemoryColor(for: accentKey),
+            accentKey: accentKey,
+            tripoSubjectCategory: tripoSubjectCategory,
+            tripoSubjectDetail: tripoSubjectDetail,
+            tripoTask: tripoTask
+        )
+    }
+}
+
+private struct StoredGeneratedSouvenir: Codable {
+    let name: String
+    let caption: String
+    let symbol: String
+    let colorKey: String
+
+    init(souvenir: GeneratedSouvenir) {
+        name = souvenir.name
+        caption = souvenir.caption
+        symbol = souvenir.symbol
+        colorKey = TravelMemoryColorKey.normalized(souvenir.colorKey)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "旅行纪念品"
+        caption = try container.decodeIfPresent(String.self, forKey: .caption) ?? "把最重要的瞬间留下"
+        symbol = try container.decodeIfPresent(String.self, forKey: .symbol) ?? "seal.fill"
+        colorKey = TravelMemoryColorKey.normalized(
+            try container.decodeIfPresent(String.self, forKey: .colorKey) ?? "teal"
+        )
+    }
+
+    var generatedSouvenir: GeneratedSouvenir {
+        GeneratedSouvenir(
+            name: name,
+            caption: caption,
+            symbol: symbol,
+            color: Color.travelMemoryColor(for: colorKey),
+            colorKey: colorKey
+        )
+    }
+}
+
+enum TravelMemoryStore {
+    struct LoadResult {
+        let memories: [MemoryProject]
+        let errorDescription: String?
+    }
+
+    static var filePath: String {
+        fileURL.path
+    }
+
+    static func load() -> LoadResult {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return LoadResult(memories: [], errorDescription: nil)
+        }
+
+        do {
+            let data = try Data(contentsOf: fileURL)
+            let storedMemories = try JSONDecoder().decode([StoredMemoryProject].self, from: data)
+            return LoadResult(
+                memories: storedMemories.map(\.memoryProject),
+                errorDescription: nil
+            )
+        } catch {
+            return LoadResult(memories: [], errorDescription: error.localizedDescription)
+        }
+    }
+
+    static func save(_ memories: [MemoryProject]) throws {
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        let storedMemories = memories.map(StoredMemoryProject.init)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(storedMemories)
+        try data.write(to: fileURL, options: [.atomic])
+    }
+
+    private static var directoryURL: URL {
+        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return baseURL.appendingPathComponent("Trouvenir", isDirectory: true)
+    }
+
+    private static var fileURL: URL {
+        directoryURL.appendingPathComponent("memories.json", isDirectory: false)
     }
 }
 
@@ -4748,11 +5997,29 @@ enum TravelArchive {
 }
 
 struct GeneratedSouvenir: Identifiable {
-    let id = UUID()
+    let id: UUID
     let name: String
     let caption: String
     let symbol: String
     let color: Color
+
+    let colorKey: String
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        caption: String,
+        symbol: String,
+        color: Color,
+        colorKey: String = "teal"
+    ) {
+        self.id = id
+        self.name = name
+        self.caption = caption
+        self.symbol = symbol
+        self.color = color
+        self.colorKey = TravelMemoryColorKey.normalized(colorKey)
+    }
 }
 
 struct LandmarkContext {
@@ -4796,24 +6063,24 @@ struct LandmarkContext {
         switch kind {
         case .mountFuji:
             return [
-                GeneratedSouvenir(name: "富士山水晶球", caption: "收藏那次云层散开的瞬间", symbol: "snowflake", color: .trouvenirTeal),
-                GeneratedSouvenir(name: "登顶纪念章", caption: "把山顶的欢呼变成徽章", symbol: "seal.fill", color: .trouvenirGold),
-                GeneratedSouvenir(name: "旅行身份卡", caption: "属于这次旅程的身份", symbol: "lanyardcard", color: .trouvenirCoral),
-                GeneratedSouvenir(name: "记忆海报", caption: "适合保存和分享", symbol: "photo.artframe", color: .trouvenirBlue)
+                GeneratedSouvenir(name: "富士山水晶球", caption: "收藏那次云层散开的瞬间", symbol: "snowflake", color: .trouvenirTeal, colorKey: "teal"),
+                GeneratedSouvenir(name: "登顶纪念章", caption: "把山顶的欢呼变成徽章", symbol: "seal.fill", color: .trouvenirGold, colorKey: "gold"),
+                GeneratedSouvenir(name: "旅行身份卡", caption: "属于这次旅程的身份", symbol: "lanyardcard", color: .trouvenirCoral, colorKey: "coral"),
+                GeneratedSouvenir(name: "记忆海报", caption: "适合保存和分享", symbol: "photo.artframe", color: .trouvenirBlue, colorKey: "blue")
             ]
         case .sanFrancisco:
             return [
-                GeneratedSouvenir(name: "金门桥珐琅章", caption: "红橙桥塔与海湾雾带", symbol: "bridge.lane", color: .trouvenirCoral),
-                GeneratedSouvenir(name: "缆车吊坠", caption: "把坡道和铃声收进掌心", symbol: "cablecar", color: .trouvenirGold),
-                GeneratedSouvenir(name: "海湾雾瓶", caption: "旧金山清晨的柔雾", symbol: "cloud", color: .trouvenirTeal),
-                GeneratedSouvenir(name: "旅行身份卡", caption: "属于这次城市漫游", symbol: "lanyardcard", color: .trouvenirBlue)
+                GeneratedSouvenir(name: "金门桥珐琅章", caption: "红橙桥塔与海湾雾带", symbol: "bridge.lane", color: .trouvenirCoral, colorKey: "coral"),
+                GeneratedSouvenir(name: "缆车吊坠", caption: "把坡道和铃声收进掌心", symbol: "cablecar", color: .trouvenirGold, colorKey: "gold"),
+                GeneratedSouvenir(name: "海湾雾瓶", caption: "旧金山清晨的柔雾", symbol: "cloud", color: .trouvenirTeal, colorKey: "teal"),
+                GeneratedSouvenir(name: "旅行身份卡", caption: "属于这次城市漫游", symbol: "lanyardcard", color: .trouvenirBlue, colorKey: "blue")
             ]
         case .generic:
             return [
-                GeneratedSouvenir(name: "\(placeName)身份卡", caption: "属于这次旅程的身份", symbol: "lanyardcard", color: .trouvenirTeal),
-                GeneratedSouvenir(name: "\(placeName)纪念章", caption: "把最重要的瞬间留下", symbol: "seal.fill", color: .trouvenirGold),
-                GeneratedSouvenir(name: "\(placeName)故事卡", caption: "多年后还能重新读到", symbol: "text.book.closed", color: .trouvenirCoral),
-                GeneratedSouvenir(name: "\(placeName)记忆海报", caption: "适合保存和分享", symbol: "photo.artframe", color: .trouvenirBlue)
+                GeneratedSouvenir(name: "\(placeName)身份卡", caption: "属于这次旅程的身份", symbol: "lanyardcard", color: .trouvenirTeal, colorKey: "teal"),
+                GeneratedSouvenir(name: "\(placeName)纪念章", caption: "把最重要的瞬间留下", symbol: "seal.fill", color: .trouvenirGold, colorKey: "gold"),
+                GeneratedSouvenir(name: "\(placeName)故事卡", caption: "多年后还能重新读到", symbol: "text.book.closed", color: .trouvenirCoral, colorKey: "coral"),
+                GeneratedSouvenir(name: "\(placeName)记忆海报", caption: "适合保存和分享", symbol: "photo.artframe", color: .trouvenirBlue, colorKey: "blue")
             ]
         }
     }
@@ -4881,16 +6148,28 @@ extension Color {
     static let trouvenirBlue = Color(red: 0.30, green: 0.42, blue: 0.64)
 
     static func travelMemoryColor(for key: String) -> Color {
-        switch key {
-        case "coral":
+        switch TravelMemoryColorKey(rawValue: TravelMemoryColorKey.normalized(key)) {
+        case .coral:
             return .trouvenirCoral
-        case "gold":
+        case .gold:
             return .trouvenirGold
-        case "blue":
+        case .blue:
             return .trouvenirBlue
-        default:
+        case .teal, .none:
             return .trouvenirTeal
         }
+    }
+}
+
+private enum TravelMemoryColorKey: String, Codable {
+    case teal
+    case coral
+    case gold
+    case blue
+
+    static func normalized(_ key: String) -> String {
+        let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return TravelMemoryColorKey(rawValue: normalizedKey)?.rawValue ?? TravelMemoryColorKey.teal.rawValue
     }
 }
 
@@ -4912,7 +6191,7 @@ extension String {
     }
 }
 
-struct TripoTask: Decodable {
+struct TripoTask: Codable {
     let taskID: String
     let status: String
     let progress: Int?
@@ -4950,7 +6229,7 @@ struct TripoTask: Decodable {
     var localizedStatus: String {
         switch status {
         case "queued":
-            return "排队中"
+            return "正在准备生成"
         case "running":
             return "生成中"
         case "success":
@@ -4964,7 +6243,7 @@ struct TripoTask: Decodable {
         case "banned":
             return "内容未通过"
         default:
-            return status
+            return isFinal ? "状态待确认" : "正在处理"
         }
     }
 
@@ -4974,15 +6253,15 @@ struct TripoTask: Decodable {
             return "checkmark.seal.fill"
         case "failed", "cancelled", "expired", "banned":
             return "exclamationmark.triangle.fill"
-        case "running":
+        case "queued", "running":
             return "wand.and.stars"
         default:
-            return "clock"
+            return isFinal ? "questionmark.circle" : "wand.and.stars"
         }
     }
 }
 
-struct TripoTaskOutput: Decodable {
+struct TripoTaskOutput: Codable {
     let model: String?
     let baseModel: String?
     let pbrModel: String?
@@ -4993,6 +6272,155 @@ struct TripoTaskOutput: Decodable {
         case baseModel = "base_model"
         case pbrModel = "pbr_model"
         case renderedImage = "rendered_image"
+    }
+}
+
+private enum TripoSouvenirPromptFactory {
+    static func prompt(for memory: MemoryProject) -> String {
+        let destinationContext = LandmarkContext(
+            destination: safeDestination(for: memory),
+            clues: "\(memory.title) \(memory.storyTitle) \(memory.story)"
+        )
+        let safeTitle = promptSnippet(
+            destinationContext.removingConflictingLandmarks(from: memory.title),
+            fallback: "\(safeDestination(for: memory)) travel memory",
+            maxLength: 48
+        )
+        let safeFeeling = promptSnippet(
+            destinationContext.removingConflictingLandmarks(from: memory.story),
+            fallback: "warm, collectible, personal travel nostalgia",
+            maxLength: 80
+        )
+
+        return """
+        Create exactly one standalone 3D subject: \(subject(for: memory, destinationContext: destinationContext)). Travel context: \(safeDestination(for: memory)). Memory: \(safeTitle). Mood: \(safeFeeling). The output must be a single complete isolated subject only, easy to separate from background, centered, with a clean silhouette. Premium handcrafted miniature collectible, polished ceramic or enamel material, crisp details. Do not create a scene, diorama, landscape, wide base, water area, background, multiple objects, or extra characters. \(destinationContext.styleGuidance)
+        """
+    }
+
+    static func negativePrompt(for memory: MemoryProject) -> String {
+        let destinationContext = LandmarkContext(
+            destination: safeDestination(for: memory),
+            clues: "\(memory.title) \(memory.storyTitle) \(memory.story)"
+        )
+        return promptSnippet(
+            "\(destinationContext.negativePrompt), multiple subjects, multiple characters, full scene, diorama, environment, background, props surrounding the subject",
+            fallback: "multiple subjects, wide landscape, flat scenic base",
+            maxLength: 220
+        )
+    }
+
+    private static func subject(for memory: MemoryProject, destinationContext: LandmarkContext) -> String {
+        let combinedText = "\(memory.destination) \(memory.title) \(memory.storyTitle) \(memory.story)"
+        let configuredCategory = promptSnippet(memory.tripoSubjectCategory, fallback: "人物", maxLength: 28)
+        let configuredDetail = promptSnippet(
+            memory.tripoSubjectDetail,
+            fallback: defaultSubjectDetail(for: configuredCategory, memory: memory, destinationContext: destinationContext),
+            maxLength: 70
+        )
+
+        if !configuredCategory.isEmpty {
+            if configuredDetail.isEmpty {
+                return configuredCategory
+            }
+
+            return "\(configuredCategory)：\(configuredDetail)"
+        }
+
+        switch destinationContext.kind {
+        case .mountFuji:
+            if combinedText.contains("登顶") || combinedText.contains("山顶") || combinedText.contains("爬") {
+                return "人物：拿着登山杖庆祝的旅行者"
+            }
+            return "人物：拿着相机记录富士山风景的旅行者"
+        case .sanFrancisco:
+            return "人物：拿着相机站在红橙色金门桥塔纪念物旁的旅行者"
+        case .generic:
+            break
+        }
+
+        if combinedText.contains("极光") {
+            return "人物：穿冬季外套在小型极光丝带下张开双臂的旅行者"
+        }
+
+        if combinedText.contains("跳伞") {
+            return "人物：带着小型降落伞装备开心落地的旅行者"
+        }
+
+        if combinedText.contains("热气球") {
+            return "交通工具：带小篮子的精致热气球纪念物"
+        }
+
+        if let firstSouvenir = memory.souvenirs.first {
+            return "随身物件：\(firstSouvenir.name)"
+        }
+
+        return "人物：带着旅行背包回头看风景的人"
+    }
+
+    private static func defaultSubjectDetail(
+        for category: String,
+        memory: MemoryProject,
+        destinationContext: LandmarkContext
+    ) -> String {
+        let memoryText = "\(memory.destination) \(memory.title) \(memory.storyTitle) \(memory.story)"
+
+        switch category {
+        case "人物":
+            switch destinationContext.kind {
+            case .mountFuji:
+                if memoryText.contains("登顶") || memoryText.contains("山顶") || memoryText.contains("爬") {
+                    return "拿着登山杖庆祝的旅行者"
+                }
+                return "拿着相机记录富士山风景的旅行者"
+            case .sanFrancisco:
+                return "拿着相机站在红橙色金门桥塔纪念物旁的旅行者"
+            case .generic:
+                if memoryText.contains("极光") {
+                    return "穿冬季外套在小型极光丝带下张开双臂的旅行者"
+                }
+                if memoryText.contains("跳伞") {
+                    return "带着小型降落伞装备开心落地的旅行者"
+                }
+                if memoryText.contains("拍照") || memoryText.contains("相机") {
+                    return "拿着相机记录风景的旅行者"
+                }
+                return "带着旅行背包回头看风景的人"
+            }
+        case "地标":
+            return "一个完整、易隔离的地标局部"
+        case "交通工具":
+            if memoryText.contains("热气球") {
+                return "带小篮子的精致热气球纪念物"
+            }
+            return "一个小型旅行交通工具"
+        case "随身物件":
+            if let firstSouvenir = memory.souvenirs.first {
+                return firstSouvenir.name
+            }
+            return "一个有旅行纪念感的随身物件"
+        case "美食":
+            return "一份完整、精致、易隔离的当地美食"
+        default:
+            return ""
+        }
+    }
+
+    private static func safeDestination(for memory: MemoryProject) -> String {
+        let destination = memory.destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        return destination.isEmpty ? "新的目的地" : destination
+    }
+
+    private static func promptSnippet(_ text: String, fallback: String, maxLength: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return fallback
+        }
+
+        if trimmed.count <= maxLength {
+            return trimmed
+        }
+
+        return String(trimmed.prefix(maxLength))
     }
 }
 
@@ -5011,6 +6439,23 @@ struct TravelMemoryAIRequest: Encodable {
     let companions: String
     let feeling: String
     let photoCount: Int
+}
+
+struct TravelLocationAIRequest: Encodable {
+    let input: String
+    let context: String
+}
+
+struct ResolvedTravelLocation: Codable {
+    let cityName: String
+    let countryName: String
+    let regionCode: String
+    let confidence: String
+    let reason: String
+
+    var hasCountry: Bool {
+        !countryName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 struct GeneratedTravelMemory: Decodable {
@@ -5042,7 +6487,8 @@ struct GeneratedTravelMemory: Decodable {
             ),
             story: story,
             souvenirs: souvenirs.map(\.generatedSouvenir),
-            accent: Color.travelMemoryColor(for: accentKey)
+            accent: Color.travelMemoryColor(for: accentKey),
+            accentKey: accentKey
         )
     }
 }
@@ -5058,7 +6504,8 @@ struct GeneratedTravelSouvenir: Decodable {
             name: name,
             caption: caption,
             symbol: symbol,
-            color: Color.travelMemoryColor(for: colorKey)
+            color: Color.travelMemoryColor(for: colorKey),
+            colorKey: colorKey
         )
     }
 }
@@ -5075,13 +6522,43 @@ struct MemoryAIClient {
     }
 
     private func send<T: Decodable>(_ request: URLRequest) async throws -> T {
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TrouvenirURLSessions.bridge.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw MemoryAIError.invalidResponse
         }
 
         if !(200..<300).contains(httpResponse.statusCode) {
             let message = APIErrorResponse.message(from: data) ?? "AI 服务返回 HTTP \(httpResponse.statusCode)"
+            throw MemoryAIError.server(message)
+        }
+
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw MemoryAIError.decodingFailed
+        }
+    }
+}
+
+struct LocationAIClient {
+    private let baseURL = TrouvenirAPIEnvironment.locationAIBaseURL
+
+    func resolveLocation(_ input: TravelLocationAIRequest) async throws -> ResolvedTravelLocation {
+        var request = URLRequest(url: baseURL.appending(path: "location"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(input)
+        return try await send(request)
+    }
+
+    private func send<T: Decodable>(_ request: URLRequest) async throws -> T {
+        let (data, response) = try await TrouvenirURLSessions.bridge.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw MemoryAIError.invalidResponse
+        }
+
+        if !(200..<300).contains(httpResponse.statusCode) {
+            let message = APIErrorResponse.message(from: data) ?? "地点识别服务返回 HTTP \(httpResponse.statusCode)"
             throw MemoryAIError.server(message)
         }
 
@@ -5148,7 +6625,7 @@ struct TripoAPIClient {
     }
 
     private func send<T: Decodable>(_ request: URLRequest) async throws -> T {
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await TrouvenirURLSessions.bridge.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw TripoAPIError.invalidResponse
         }

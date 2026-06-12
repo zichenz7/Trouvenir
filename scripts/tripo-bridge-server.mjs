@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFileSync, readFileSync } from "node:fs";
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,22 +12,23 @@ const defaultModelVersion = "P1-20260311";
 
 loadEnv();
 
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.PORT || process.env.FC_CUSTOM_LISTEN_PORT || 3000);
 const host = process.env.HOST || "127.0.0.1";
 const debugEndpointsEnabled = process.env.TROUVENIR_ENABLE_DEBUG_ENDPOINTS === "1"
   || process.env.NODE_ENV !== "production";
 const tripoBaseURL = (process.env.TRIPO_BASE_URL || "https://api.tripo3d.ai/v2/openapi").replace(/\/$/, "");
 const deepseekBaseURL = (process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "");
 const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
-const diagnosticDir = resolve(projectRoot, "artifacts", "ios-render-diagnostics");
+const dataRoot = resolve(process.env.TROUVENIR_DATA_DIR || projectRoot);
+const diagnosticDir = resolve(dataRoot, "artifacts", "ios-render-diagnostics");
 const diagnosticLogPath = resolve(diagnosticDir, "render.ndjson");
 const diagnosticMaxBytes = Number(process.env.TROUVENIR_RENDER_LOG_MAX_BYTES || 1_000_000);
 const diagnosticMaxAgeMs = Number(process.env.TROUVENIR_RENDER_LOG_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000);
-const appDiagnosticDir = resolve(projectRoot, "artifacts", "ios-app-diagnostics");
+const appDiagnosticDir = resolve(dataRoot, "artifacts", "ios-app-diagnostics");
 const appDiagnosticLogPath = resolve(appDiagnosticDir, "app.ndjson");
 const appDiagnosticMaxBytes = Number(process.env.TROUVENIR_APP_LOG_MAX_BYTES || 1_000_000);
 const appDiagnosticMaxAgeMs = Number(process.env.TROUVENIR_APP_LOG_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000);
-const modelCacheDir = resolve(projectRoot, "artifacts", "tripo-model-cache");
+const modelCacheDir = resolve(dataRoot, "artifacts", "tripo-model-cache");
 const modelCacheMaxBytes = Number(process.env.TROUVENIR_MODEL_CACHE_MAX_BYTES || 220 * 1024 * 1024);
 const modelCacheMaxAgeMs = Number(process.env.TROUVENIR_MODEL_CACHE_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000);
 const configuredAllowedModelHosts = String(process.env.TROUVENIR_MODEL_PROXY_ALLOW_HOSTS || "")
@@ -114,6 +115,12 @@ createServer(async (request, response) => {
       return;
     }
 
+    if (method === "POST" && pathname === "/api/ai/location") {
+      const body = await readJson(request);
+      sendJson(response, 200, await createLocationResolution(body));
+      return;
+    }
+
     if (method === "POST" && pathname === "/api/ai/memory") {
       const body = await readJson(request);
       sendJson(response, 200, await createTravelMemory(body));
@@ -122,6 +129,11 @@ createServer(async (request, response) => {
 
     if (method === "GET" && pathname === "/api/tripo/balance") {
       sendJson(response, 200, await tripoRequest("/user/balance"));
+      return;
+    }
+
+    if (method === "GET" && pathname === "/api/tripo/upstream-check") {
+      sendJson(response, 200, await checkTripoUpstream());
       return;
     }
 
@@ -193,7 +205,7 @@ async function createTravelMemory(input) {
           "JSON schema:",
           JSON.stringify({
             title: "18字以内的旅行标题",
-            destination: "目的地，尽量简短",
+            destination: "用于归档的城市或地区名，不要国家名，不要景点门店名；例如 好莱坞环球影城=>洛杉矶，Alcatraz Island=>旧金山，Newport Beach=>Newport Beach",
             identityTitle: "例如 富士山收藏家",
             companions: "同行的人，未知则用 独自旅行",
             walkingDistance: "例如 42 公里，无法判断可合理估计",
@@ -248,6 +260,72 @@ async function createTravelMemory(input) {
   return normalized;
 }
 
+async function createLocationResolution(input) {
+  const rawInput = compactText(input.input || input.destination || input.cityName, 160);
+  const context = compactText(input.context, 300);
+
+  if (!rawInput) {
+    throw new BridgeError("input is required", 400);
+  }
+
+  const payload = {
+    model: deepseekModel,
+    messages: [
+      {
+        role: "system",
+        content: [
+          "你是 Trouvenir 的地点归一化服务。",
+          "你的任务是把用户输入的旅行地点、景点、城市别名或中英文混合地名，解析成适合旅行归档的城市/地区和国家。",
+          "只输出 JSON，不要 Markdown，不要解释。",
+          "如果能确定景点所在城市，cityName 输出城市名；如果它本身就是城市，cityName 输出该城市。",
+          "countryName 必须使用中文常用国家/地区名，例如 美国、日本、法国、中国大陆、英国、澳大利亚。",
+          "regionCode 使用 ISO 3166-1 alpha-2，例如 US、JP、FR、CN。",
+          "如果无法可靠判断，confidence 输出 low，countryName 和 regionCode 可以留空；不要硬猜中国大陆。"
+        ].join("\n")
+      },
+      {
+        role: "user",
+        content: [
+          "解析以下地点：",
+          JSON.stringify({ input: rawInput, context }),
+          "JSON schema:",
+          JSON.stringify({
+            cityName: "用于归档的城市或地区名",
+            countryName: "中文国家/地区名，无法判断则为空字符串",
+            regionCode: "ISO 3166-1 alpha-2，无法判断则为空字符串",
+            confidence: "high | medium | low",
+            reason: "一句话说明依据"
+          })
+        ].join("\n")
+      }
+    ],
+    temperature: 0,
+    max_tokens: 500,
+    response_format: { type: "json_object" }
+  };
+
+  const startedAt = Date.now();
+  const result = await deepseekRequest("/chat/completions", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  const content = messageContent(result.choices?.[0]?.message);
+  const location = normalizeLocationResolution(parseJsonObject(content), rawInput);
+
+  console.log(JSON.stringify({
+    event: "deepseek_location_resolved",
+    model: result.model ?? deepseekModel,
+    inputLength: rawInput.length,
+    cityName: location.cityName,
+    countryName: location.countryName,
+    regionCode: location.regionCode,
+    confidence: location.confidence,
+    durationMs: Date.now() - startedAt
+  }));
+
+  return location;
+}
+
 async function createTextToModelTask(input) {
   if (!String(input.prompt ?? "").trim()) {
     throw new BridgeError("prompt is required", 400);
@@ -278,6 +356,50 @@ async function createTextToModelTask(input) {
   }
 
   return created.task_id;
+}
+
+async function checkTripoUpstream() {
+  const apiKey = process.env.TRIPO_API_KEY;
+  if (!apiKey) {
+    return {
+      ok: false,
+      stage: "config",
+      message: "TRIPO_API_KEY is not configured"
+    };
+  }
+
+  try {
+    const { status, payload } = await curlJson({
+      method: "GET",
+      url: `${tripoBaseURL}/user/balance`,
+      headers: {
+        Authorization: `Bearer ${apiKey}`
+      },
+      resolveHost: tripoResolveHost(),
+      connectTimeoutSeconds: Number(process.env.TRIPO_UPSTREAM_CONNECT_TIMEOUT_SECONDS || 8),
+      maxTimeSeconds: Number(process.env.TRIPO_UPSTREAM_CHECK_TIMEOUT_SECONDS || 18)
+    });
+
+    return {
+      ok: status >= 200 && status < 300 && payload.code === 0,
+      stage: "tripo",
+      httpStatus: status,
+      tripoCode: payload.code ?? null,
+      message: payload.message ?? "ok",
+      hasHttpsProxy: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy),
+      hasHttpProxy: Boolean(process.env.HTTP_PROXY || process.env.http_proxy),
+      hasResolveHost: Boolean(tripoResolveHost())
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      stage: "network",
+      message: error.message,
+      hasHttpsProxy: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy),
+      hasHttpProxy: Boolean(process.env.HTTP_PROXY || process.env.http_proxy),
+      hasResolveHost: Boolean(tripoResolveHost())
+    };
+  }
 }
 
 async function tripoRequest(path, init = {}) {
@@ -514,13 +636,21 @@ async function proxyModelFile(requestURL, request, response) {
   void cleanupModelCache();
 }
 
-async function curlJson({ method, url, headers, body, resolveHost }) {
+async function curlJson({
+  method,
+  url,
+  headers,
+  body,
+  resolveHost,
+  connectTimeoutSeconds = 20,
+  maxTimeSeconds = 120
+}) {
   const args = [
     "-sS",
     "--connect-timeout",
-    "20",
+    String(connectTimeoutSeconds),
     "--max-time",
-    "120",
+    String(maxTimeSeconds),
     "-w",
     "\n%{http_code}",
     "-X",
@@ -786,45 +916,57 @@ function corsHeaders() {
 }
 
 async function appendRenderDiagnostic(input) {
-  const entry = sanitizeDiagnosticObject({
-    ts: new Date().toISOString(),
-    level: input.level || "info",
-    source: input.source || "bridge",
-    event: input.event || "bridge.event",
-    session: input.session || input.sessionID || null,
-    data: input.data || {}
-  });
+  try {
+    const entry = sanitizeDiagnosticObject({
+      ts: new Date().toISOString(),
+      level: input.level || "info",
+      source: input.source || "bridge",
+      event: input.event || "bridge.event",
+      session: input.session || input.sessionID || null,
+      data: input.data || {}
+    });
 
-  await mkdir(diagnosticDir, { recursive: true });
-  await rotateDiagnosticLogIfNeeded();
-  await appendFile(diagnosticLogPath, `${JSON.stringify(entry)}\n`, "utf8");
+    await mkdir(diagnosticDir, { recursive: true });
+    await rotateDiagnosticLogIfNeeded();
+    appendFileSync(diagnosticLogPath, `${JSON.stringify(entry)}\n`, "utf8");
 
-  const now = Date.now();
-  if (now - lastDiagnosticCleanupAt > 60_000) {
-    lastDiagnosticCleanupAt = now;
-    void cleanupDiagnosticLogs();
+    const now = Date.now();
+    if (now - lastDiagnosticCleanupAt > 60_000) {
+      lastDiagnosticCleanupAt = now;
+      void cleanupDiagnosticLogs().catch((error) => {
+        console.error("Render diagnostic cleanup failed:", error);
+      });
+    }
+  } catch (error) {
+    console.error("Render diagnostic write failed:", error);
   }
 }
 
 async function appendAppDiagnostic(input) {
-  const entry = sanitizeDiagnosticObject({
-    ts: new Date().toISOString(),
-    level: input.level || "info",
-    source: input.source || "ios-app",
-    event: input.event || "app.event",
-    session: input.session || input.sessionID || null,
-    call: input.call || null,
-    data: input.data || {}
-  });
+  try {
+    const entry = sanitizeDiagnosticObject({
+      ts: new Date().toISOString(),
+      level: input.level || "info",
+      source: input.source || "ios-app",
+      event: input.event || "app.event",
+      session: input.session || input.sessionID || null,
+      call: input.call || null,
+      data: input.data || {}
+    });
 
-  await mkdir(appDiagnosticDir, { recursive: true });
-  await rotateAppDiagnosticLogIfNeeded();
-  await appendFile(appDiagnosticLogPath, `${JSON.stringify(entry)}\n`, "utf8");
+    await mkdir(appDiagnosticDir, { recursive: true });
+    await rotateAppDiagnosticLogIfNeeded();
+    appendFileSync(appDiagnosticLogPath, `${JSON.stringify(entry)}\n`, "utf8");
 
-  const now = Date.now();
-  if (now - lastAppDiagnosticCleanupAt > 60_000) {
-    lastAppDiagnosticCleanupAt = now;
-    void cleanupAppDiagnosticLogs();
+    const now = Date.now();
+    if (now - lastAppDiagnosticCleanupAt > 60_000) {
+      lastAppDiagnosticCleanupAt = now;
+      void cleanupAppDiagnosticLogs().catch((error) => {
+        console.error("App diagnostic cleanup failed:", error);
+      });
+    }
+  } catch (error) {
+    console.error("App diagnostic write failed:", error);
   }
 }
 
@@ -1238,6 +1380,23 @@ function normalizeTravelMemory(memory, input) {
       symbol: compactText(item?.symbol, 28) || fallbackSouvenir(destination, index).symbol,
       colorKey: oneOf(item?.colorKey, ["teal", "coral", "gold", "blue"], ["teal", "gold", "coral", "blue"][index % 4])
     }))
+  };
+}
+
+function normalizeLocationResolution(location, rawInput) {
+  const cityName = compactText(location?.cityName, 60) || rawInput;
+  const countryName = compactText(location?.countryName, 40);
+  const rawRegionCode = compactText(location?.regionCode, 8).toUpperCase();
+  const regionCode = /^[A-Z]{2}$/.test(rawRegionCode) ? rawRegionCode : "";
+  const confidence = oneOf(location?.confidence, ["high", "medium", "low"], countryName ? "medium" : "low");
+  const reason = compactText(location?.reason, 120);
+
+  return {
+    cityName,
+    countryName,
+    regionCode,
+    confidence,
+    reason
   };
 }
 

@@ -261,9 +261,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Trouvenir;
 				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Trouvenir uses the camera to capture travel memories.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Trouvenir uses the microphone to turn spoken travel memories into text.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Trouvenir reads selected photos to create travel memories.";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Trouvenir uses speech recognition to transcribe your travel memories.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -297,9 +295,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = Trouvenir;
 				INFOPLIST_KEY_CFBundleIconName = AppIcon;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Trouvenir uses the camera to capture travel memories.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Trouvenir uses the microphone to turn spoken travel memories into text.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Trouvenir reads selected photos to create travel memories.";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Trouvenir uses speech recognition to transcribe your travel memories.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

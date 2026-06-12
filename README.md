@@ -149,10 +149,11 @@ TROUVENIR_ENABLE_DEBUG_ENDPOINTS=0
 After deployment, verify the public service:
 
 ```bash
-curl https://trouvenir-api.onrender.com/health
+curl https://api-souvenir-lqbumpvbta.cn-hongkong.fcapp.run/health
+curl https://api-souvenir-lqbumpvbta.cn-hongkong.fcapp.run/api/tripo/upstream-check
 ```
 
-The iOS app uses `http://127.0.0.1:3000` in Debug builds and `https://trouvenir-api.onrender.com` in Release/TestFlight builds. To temporarily point any build at another bridge, set the `TROUVENIR_BRIDGE_BASE_URL` launch environment variable.
+The iOS app uses `http://127.0.0.1:3000` for Simulator Debug builds and `https://api-souvenir-lqbumpvbta.cn-hongkong.fcapp.run` for physical-device Debug, Release, and TestFlight builds. To temporarily point any build at another bridge, set the `TROUVENIR_BRIDGE_BASE_URL` launch environment variable.
 
 ## Run the iOS app with DeepSeek and Tripo
 
