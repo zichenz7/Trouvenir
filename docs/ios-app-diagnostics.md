@@ -52,10 +52,11 @@ tail -n 240 artifacts/ios-app-diagnostics/app.ndjson | jq -c 'select(.event=="lo
 - `call`: which view or resolver asked for the mapping.
 
 4. If `data.rule` is `fallback.destination`, check for a nearby `location.ai.resolve.success`. This means the app used DeepSeek to normalize a long-tail place and cached the city/country result.
-5. If `location.ai.resolve.error` appears, inspect the bridge `/api/ai/location` path, DeepSeek config, and network logs before adding another local rule.
-6. If `location.ai.resolve.unusable` appears, DeepSeek returned low confidence or no country. Add a deterministic rule for high-value regressions, then keep CLGeocoder as the last fallback.
-7. If a `location.country.resolve.geocode.rejected` event appears, the app intentionally ignored a low-confidence CLGeocoder match. For Latin-letter place names, the placemark must contain a core token from the original query before the country is accepted.
-8. If a `location.country.resolve.geocode.success` event disagrees with the deterministic or DeepSeek rule, keep the deterministic/DeepSeek result authoritative and treat the geocoder result as suspect evidence.
+5. If `location.ai.resolve.cancelled` appears, the view task was interrupted by navigation or tab switching. The app should emit `location.country.resolve.ai.pending` and must not fall through to CLGeocoder in that same pass.
+6. If `location.ai.resolve.error` appears, inspect the bridge `/api/ai/location` path, DeepSeek config, and network logs before adding another local rule.
+7. If `location.ai.resolve.unusable` appears, DeepSeek returned low confidence or no country. Add a deterministic rule for high-value regressions, then keep CLGeocoder as the last fallback.
+8. If a `location.country.resolve.geocode.rejected` event appears, the app intentionally ignored a low-confidence CLGeocoder match. For Latin-letter place names, the placemark must contain a core token from the original query before the country is accepted.
+9. If a `location.country.resolve.geocode.success` event disagrees with the deterministic or DeepSeek rule, keep the deterministic/DeepSeek result authoritative and treat the geocoder result as suspect evidence.
 
 ## DeepSeek Location Resolver
 
@@ -123,3 +124,13 @@ A healthy run for the Hollywood / Los Angeles regression should include:
 ```
 
 The previous broken pattern was `fallback.destination` for `洛杉矶`, followed by `location.country.resolve.geocode.success` with a China placemark such as `福建省厦门市思明区源昌国际城2期269号楼`. The deterministic Los Angeles rule should make the country resolver emit `location.country.resolve.known` instead. If a non-Latin query still falls through to CLGeocoder, China placemarks are rejected unless the placemark evidence contains the original query.
+
+## Healthy Yellowstone Evidence
+
+A healthy run for the Yellowstone regression should include:
+
+```json
+{"event":"location.resolve","data":{"input":"黄石","city":"黄石","country":"美国","regionCode":"US","rule":"known.yellowstone","matchedTerm":"黄石"}}
+```
+
+The previous broken pattern was `location.ai.resolve.start` followed by `location.ai.resolve.error` with `message: "cancelled"`, then immediate `location.country.resolve.geocode.success` with `isoCountryCode: "CN"` and `placemarkName: "黄石市"`. A cancelled DeepSeek task should now produce `location.country.resolve.ai.pending` instead of accepting the CLGeocoder China result.
